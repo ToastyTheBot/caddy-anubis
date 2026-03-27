@@ -1,7 +1,7 @@
 package caddyanubis
 
 import (
-	"log/slog"
+	"context"
 	"net/http"
 
 	"github.com/TecharoHQ/anubis"
@@ -14,6 +14,10 @@ import (
 	"go.uber.org/zap"
 )
 
+// nextHandlerCtxKey is used to pass the Caddy next handler through the
+// request context, avoiding shared mutable state on the middleware struct.
+type nextHandlerCtxKey struct{}
+
 func init() {
 	caddy.RegisterModule(AnubisMiddleware{})
 	httpcaddyfile.RegisterHandlerDirective("anubis", parseCaddyfile)
@@ -21,12 +25,12 @@ func init() {
 }
 
 type AnubisMiddleware struct {
-	Target       *string `json:"target,omitempty"`
-	AnubisPolicy *policy.ParsedConfig
-	AnubisServer *libanubis.Server
-	Next         caddyhttp.Handler
+	Target     *string `json:"target,omitempty"`
+	PolicyFile string  `json:"policy_file,omitempty"`
 
-	logger *zap.Logger
+	anubisPolicy *policy.ParsedConfig
+	anubisServer *libanubis.Server
+	logger       *zap.Logger
 }
 
 // CaddyModule returns the Caddy module information.
@@ -40,33 +44,34 @@ func (AnubisMiddleware) CaddyModule() caddy.ModuleInfo {
 // Provision implements caddy.Provisioner.
 func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger().Named("anubis")
-	m.logger.Info("Anubis middleware provisioning")
 
-	policy, err := libanubis.LoadPoliciesOrDefault("", anubis.DefaultDifficulty)
+	pol, err := libanubis.LoadPoliciesOrDefault(ctx, m.PolicyFile, anubis.DefaultDifficulty, "info")
 	if err != nil {
 		return err
 	}
+	m.anubisPolicy = pol
 
-	m.AnubisPolicy = policy
-
-	m.AnubisServer, err = libanubis.New(libanubis.Options{
+	m.anubisServer, err = libanubis.New(libanubis.Options{
 		Next: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			m.logger.Info("Anubis middleware calling next")
-
 			if m.Target != nil {
 				http.Redirect(w, r, *m.Target, http.StatusTemporaryRedirect)
-			} else {
-				m.Next.ServeHTTP(w, r)
+				return
+			}
+			next, ok := r.Context().Value(nextHandlerCtxKey{}).(caddyhttp.Handler)
+			if ok && next != nil {
+				if err := next.ServeHTTP(w, r); err != nil {
+					m.logger.Error("downstream handler error", zap.Error(err))
+				}
 			}
 		}),
-		Policy:         m.AnubisPolicy,
+		Policy:         m.anubisPolicy,
 		ServeRobotsTXT: true,
 	})
 	if err != nil {
 		return err
 	}
 
-	m.logger.Info("Anubis middleware provisioned")
+	m.logger.Info("anubis middleware provisioned")
 	return nil
 }
 
@@ -77,11 +82,8 @@ func (m *AnubisMiddleware) Validate() error {
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
 func (m *AnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	m.logger.Info("Anubis middleware processing request")
-	slog.SetLogLoggerLevel(slog.LevelDebug)
-	m.logger.Info("Anubis middleware sending request")
-	m.Next = next
-	m.AnubisServer.ServeHTTP(w, r)
+	ctx := context.WithValue(r.Context(), nextHandlerCtxKey{}, next)
+	m.anubisServer.ServeHTTP(w, r.WithContext(ctx))
 	return nil
 }
 
@@ -89,7 +91,6 @@ func (m *AnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, nex
 func (m *AnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume directive name
 
-	// require an argument
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
 		switch d.Val() {
 		case "target":
@@ -97,6 +98,12 @@ func (m *AnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				val := d.Val()
 				m.Target = &val
 			}
+		case "policy_file":
+			if d.NextArg() {
+				m.PolicyFile = d.Val()
+			}
+		default:
+			return d.Errf("unrecognized option: %s", d.Val())
 		}
 	}
 

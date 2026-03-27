@@ -1,20 +1,19 @@
-
 {
-	#order anubis after encode
-	#order redir after anubis
+	# No global order override needed; anubis registers itself after templates.
 }
 
 :18888 {
-		request_header +X-Real-IP {remote_host}
-		request_header +X-Forwarded-For {remote_host}
+	request_header +X-Real-IP {remote_host}
+	request_header +X-Forwarded-For {remote_host}
 
+	# Anubis now works inside handle blocks.
+	handle {
 		anubis
-		
-		handle / {
-			try_files {path} /index.html
-			file_server {
-				root web/
-				browse
-			}
+
+		try_files {path} /index.html
+		file_server {
+			root web/
+			browse
 		}
+	}
 }
