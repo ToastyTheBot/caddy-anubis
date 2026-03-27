@@ -1,0 +1,46 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install xcaddy
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+
+      # Clone the pinned Anubis version and generate its build artifacts.
+      # The preact challenge embeds static/app.js which is produced by esbuild.
+      - name: Generate Anubis assets
+        run: |
+          ANUBIS_VERSION=$(grep 'github.com/TecharoHQ/anubis' go.mod | grep -v replace | awk '{print $2}')
+          git clone --branch "${ANUBIS_VERSION}" --depth 1 https://github.com/TecharoHQ/anubis.git /tmp/anubis
+          cd /tmp/anubis
+          npm ci
+          make assets
+
+      - name: Build Caddy with caddy-anubis plugin
+        run: |
+          xcaddy build \
+            --with github.com/daegalus/caddy-anubis=. \
+            --replace github.com/TecharoHQ/anubis=/tmp/anubis
+
+      - name: Verify binary
+        run: ./caddy version
+
+      - name: Vet
+        run: go vet ./...
