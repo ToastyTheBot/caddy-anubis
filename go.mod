@@ -8,7 +8,7 @@ require (
 	go.uber.org/zap v1.27.1
 )
 
-replace github.com/TecharoHQ/anubis v1.25.0 => /tmp/analysis/anubis
+replace github.com/TecharoHQ/anubis v1.25.0 => ./_anubis
 
 require (
 	github.com/a-h/templ v0.3.960 // indirect

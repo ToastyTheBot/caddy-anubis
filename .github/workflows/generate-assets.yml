@@ -1,0 +1,96 @@
+name: Generate Anubis Assets
+
+on:
+  push:
+    branches: [main]
+    paths: [go.mod]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Determine Anubis version
+        id: version
+        run: |
+          ANUBIS_VERSION=$(grep 'github.com/TecharoHQ/anubis' go.mod | grep -v replace | awk '{print $2}')
+          echo "anubis_version=${ANUBIS_VERSION}" >> "$GITHUB_OUTPUT"
+
+          CURRENT_VERSION=""
+          if [ -f _anubis_assets/.anubis-version ]; then
+            CURRENT_VERSION=$(cat _anubis_assets/.anubis-version)
+          fi
+          echo "current_version=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if update needed
+        id: check
+        env:
+          ANUBIS_VERSION: ${{ steps.version.outputs.anubis_version }}
+          CURRENT_VERSION: ${{ steps.version.outputs.current_version }}
+        run: |
+          if [ "$ANUBIS_VERSION" = "$CURRENT_VERSION" ] && [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Anubis version unchanged ($ANUBIS_VERSION), skipping."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Updating assets: $CURRENT_VERSION -> $ANUBIS_VERSION"
+          fi
+
+      - name: Clone and build Anubis assets
+        if: steps.check.outputs.skip != 'true'
+        env:
+          ANUBIS_VERSION: ${{ steps.version.outputs.anubis_version }}
+        run: |
+          git clone --branch "${ANUBIS_VERSION}" --depth 1 https://github.com/TecharoHQ/anubis.git /tmp/anubis
+          cd /tmp/anubis
+          npm ci
+          make assets
+
+      - name: Extract generated assets
+        if: steps.check.outputs.skip != 'true'
+        env:
+          ANUBIS_VERSION: ${{ steps.version.outputs.anubis_version }}
+        run: |
+          rm -rf _anubis_assets
+          mkdir -p _anubis_assets
+
+          cd /tmp/anubis
+          # Collect only gitignored files (the generated build artifacts)
+          git status --porcelain --ignored | grep '^!!' | sed 's/^!! //' \
+            | grep -v node_modules | grep -v '.env' | grep -v '.husky' \
+            | while read f; do
+                if [ -d "$f" ]; then
+                  mkdir -p "$GITHUB_WORKSPACE/_anubis_assets/$f"
+                  cp -r "${f}"* "$GITHUB_WORKSPACE/_anubis_assets/$f" 2>/dev/null || true
+                elif [ -f "$f" ]; then
+                  mkdir -p "$GITHUB_WORKSPACE/_anubis_assets/$(dirname "$f")"
+                  cp "$f" "$GITHUB_WORKSPACE/_anubis_assets/$f"
+                fi
+              done
+
+          echo "${ANUBIS_VERSION}" > "$GITHUB_WORKSPACE/_anubis_assets/.anubis-version"
+
+      - name: Commit and push
+        if: steps.check.outputs.skip != 'true'
+        env:
+          ANUBIS_VERSION: ${{ steps.version.outputs.anubis_version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f _anubis_assets/
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: update anubis ${ANUBIS_VERSION} generated assets [skip ci]"
+          git push
