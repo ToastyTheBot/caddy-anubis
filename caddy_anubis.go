@@ -4,9 +4,9 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/TecharoHQ/anubis"
-	libanubis "github.com/TecharoHQ/anubis/lib"
-	"github.com/TecharoHQ/anubis/lib/policy"
+	"github.com/ToastyTheBot/anubis"
+	libanubis "github.com/ToastyTheBot/anubis/lib"
+	"github.com/ToastyTheBot/anubis/lib/policy"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"

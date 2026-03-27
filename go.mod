@@ -3,12 +3,10 @@ module github.com/daegalus/caddy-anubis
 go 1.25.0
 
 require (
-	github.com/TecharoHQ/anubis v1.25.0
+	github.com/ToastyTheBot/anubis v1.25.1-0.20260327062447-e168666881b6
 	github.com/caddyserver/caddy/v2 v2.11.2
 	go.uber.org/zap v1.27.1
 )
-
-replace github.com/TecharoHQ/anubis v1.25.0 => ./_anubis
 
 require (
 	github.com/a-h/templ v0.3.960 // indirect

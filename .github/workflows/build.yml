@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  GOPRIVATE: github.com/ToastyTheBot/*
+  GONOSUMCHECK: github.com/ToastyTheBot/*
+  GONOSUMDB: github.com/ToastyTheBot/*
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -20,12 +25,10 @@ jobs:
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
       - name: Build Caddy with caddy-anubis plugin
-        run: make build
+        run: xcaddy build --with github.com/daegalus/caddy-anubis=.
 
       - name: Verify binary
         run: ./caddy version
 
       - name: Vet
-        run: |
-          make prep
-          go vet ./...
+        run: go vet ./...

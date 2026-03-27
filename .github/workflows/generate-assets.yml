@@ -1,4 +1,4 @@
-name: Generate Anubis Assets
+name: Update Anubis Fork
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  generate:
+  update-fork:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,71 +26,68 @@ jobs:
       - name: Determine Anubis version
         id: version
         run: |
-          ANUBIS_VERSION=$(grep 'github.com/TecharoHQ/anubis' go.mod | grep -v replace | awk '{print $2}')
+          ANUBIS_VERSION=$(grep 'github.com/ToastyTheBot/anubis' go.mod | awk '{print $2}')
           echo "anubis_version=${ANUBIS_VERSION}" >> "$GITHUB_OUTPUT"
 
-          CURRENT_VERSION=""
-          if [ -f _anubis_assets/.anubis-version ]; then
-            CURRENT_VERSION=$(cat _anubis_assets/.anubis-version)
-          fi
-          echo "current_version=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Check if update needed
-        id: check
-        env:
-          ANUBIS_VERSION: ${{ steps.version.outputs.anubis_version }}
-          CURRENT_VERSION: ${{ steps.version.outputs.current_version }}
-        run: |
-          if [ "$ANUBIS_VERSION" = "$CURRENT_VERSION" ] && [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Anubis version unchanged ($ANUBIS_VERSION), skipping."
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "Updating assets: $CURRENT_VERSION -> $ANUBIS_VERSION"
-          fi
-
-      - name: Clone and build Anubis assets
-        if: steps.check.outputs.skip != 'true'
+      - name: Clone upstream Anubis at base version
         env:
           ANUBIS_VERSION: ${{ steps.version.outputs.anubis_version }}
         run: |
-          git clone --branch "${ANUBIS_VERSION}" --depth 1 https://github.com/TecharoHQ/anubis.git /tmp/anubis
+          # Extract the upstream tag from the pseudo-version or use directly
+          # The fork is based on upstream tags, so derive the base version
+          BASE_TAG=$(echo "$ANUBIS_VERSION" | sed -E 's/^v([0-9]+\.[0-9]+)\.[0-9]+-0\..*/v\1.0/')
+          echo "Cloning upstream Anubis at ${BASE_TAG}"
+          git clone --branch "${BASE_TAG}" --depth 1 https://github.com/TecharoHQ/anubis.git /tmp/anubis
+
+      - name: Build Anubis assets
+        run: |
           cd /tmp/anubis
           npm ci
           make assets
 
-      - name: Extract generated assets
-        if: steps.check.outputs.skip != 'true'
+      - name: Update fork
         env:
           ANUBIS_VERSION: ${{ steps.version.outputs.anubis_version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          rm -rf _anubis_assets
-          mkdir -p _anubis_assets
+          git clone https://x-access-token:${GH_TOKEN}@github.com/ToastyTheBot/anubis.git /tmp/anubis-fork
+          cd /tmp/anubis-fork
+          git checkout caddy-assets || git checkout -b caddy-assets
 
-          cd /tmp/anubis
-          # Collect only gitignored files (the generated build artifacts)
-          git status --porcelain --ignored | grep '^!!' | sed 's/^!! //' \
-            | grep -v node_modules | grep -v '.env' | grep -v '.husky' \
-            | while read f; do
-                if [ -d "$f" ]; then
-                  mkdir -p "$GITHUB_WORKSPACE/_anubis_assets/$f"
-                  cp -r "${f}"* "$GITHUB_WORKSPACE/_anubis_assets/$f" 2>/dev/null || true
-                elif [ -f "$f" ]; then
-                  mkdir -p "$GITHUB_WORKSPACE/_anubis_assets/$(dirname "$f")"
-                  cp "$f" "$GITHUB_WORKSPACE/_anubis_assets/$f"
-                fi
-              done
+          # Copy upstream source at the tag
+          rsync -a --delete --exclude='.git' /tmp/anubis/ /tmp/anubis-fork/
 
-          echo "${ANUBIS_VERSION}" > "$GITHUB_WORKSPACE/_anubis_assets/.anubis-version"
+          # Rewrite module path
+          sed -i 's|module github.com/TecharoHQ/anubis|module github.com/ToastyTheBot/anubis|' go.mod
+          find . -name '*.go' -exec sed -i 's|"github.com/TecharoHQ/anubis|"github.com/ToastyTheBot/anubis|g' {} +
 
-      - name: Commit and push
-        if: steps.check.outputs.skip != 'true'
-        env:
-          ANUBIS_VERSION: ${{ steps.version.outputs.anubis_version }}
-        run: |
+          # Remove .gitignore rules that hide generated assets
+          rm -f lib/challenge/preact/static/.gitignore
+          rm -f web/static/js/.gitignore
+          rm -f xess/.gitignore
+          sed -i '/^web\/static\/locales\/\*\.json$/d' .gitignore
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f _anubis_assets/
+          git add -A
           git diff --cached --quiet && echo "No changes to commit" && exit 0
-          git commit -m "chore: update anubis ${ANUBIS_VERSION} generated assets [skip ci]"
+          git commit -m "chore: update anubis assets for ${ANUBIS_VERSION} [skip ci]"
+          git push origin caddy-assets
+
+      - name: Update go.mod to point to new fork commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOPRIVATE: github.com/ToastyTheBot/*
+          GONOSUMCHECK: github.com/ToastyTheBot/*
+          GONOSUMDB: github.com/ToastyTheBot/*
+        run: |
+          FORK_COMMIT=$(cd /tmp/anubis-fork && git rev-parse HEAD)
+          go get github.com/ToastyTheBot/anubis@${FORK_COMMIT}
+          go mod tidy
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add go.mod go.sum
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: update anubis fork reference [skip ci]"
           git push
