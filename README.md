@@ -1,36 +1,40 @@
 # caddy-anubis
 
-caddy-anubis is a plugin that loads anubis for requests in order to slow down AI and Scraper traffic from destroying infrastucture.
+A Caddy plugin that integrates [Anubis](https://github.com/TecharoHQ/anubis) proof-of-work challenges to protect upstream resources from scraper bots and AI crawlers.
 
-I consider this current implementation more of a Proof-of-Concept. I am not sure how stable or well it works. This is my first Caddy plugin. I do not currently recommend it for production usage.
+## Installation
 
-If you have experience with Caddy plugins, or see obvious issues in my code, feel free to open PRs or reach out to me.
+Build Caddy with this plugin using xcaddy:
 
-## Known Issues
+```bash
+GOPRIVATE=github.com/ToastyTheBot/* xcaddy build --with github.com/ToastyTheBot/caddy-anubis
+```
 
-- One major issue is the very first request after a Caddy start or restart, takes like 5 seconds till anubis kicks in. All subsequent requests, even after clearing cookies, are near instant.
+## Usage
 
-## Current usage
-
-Just add an `anubis` to your caddyfile in the block you want the protection. currently I have not seen it work properly inside a `route` or `handler` block. But it works outside of those.
-
-There is an optional `target` field you can set if you want to force the redirect elsewhere. It does a 302 redirect.
-
-Example (also check the caddyfile in this repo, it is used for testing):
+Add `anubis` to your Caddyfile. It works both at the top level and inside `route`/`handle` blocks:
 
 ```caddy
-
 :80 {
-  anubis
+    handle {
+        anubis
+        reverse_proxy localhost:8080
+    }
+}
+```
 
-  # or 
+### Options
 
-  anubis {
-    target https://qwant.com
-  }
+```caddy
+anubis {
+    # Redirect to a fixed URL instead of proxying to the next handler
+    target https://example.com
+
+    # Path to a custom Anubis policy file
+    policy_file /etc/anubis/policy.yaml
 }
 ```
 
 ## Credits
 
-- [anubis](https://github.com/TecharoHQ/anubis) - the project that started all of this.
+- [Anubis](https://github.com/TecharoHQ/anubis) - the proof-of-work challenge engine.
