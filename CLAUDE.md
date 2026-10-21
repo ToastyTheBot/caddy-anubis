@@ -19,7 +19,7 @@ This is a **Caddy HTTP server module** that integrates [Anubis](https://github.c
 The entire plugin is a single Go file: `caddy_anubis.go`. Three middleware types:
 
 - **`initAnubisMiddleware`** - Provisions the global Anubis server (with a stub `http.NotFound` next handler) and serves `/.within.website/*` routes. Registered via `RegisterDirective` so it creates its own route with path matching, independent of `handle` blocks.
-- **`AnubisMiddleware`** - Creates its own Anubis server per-instance with the correct Caddy passthrough (via `context.WithValue`). Sets `X-Real-IP` from the peer address when absent (Anubis requires the header and trusts it unconditionally). Optionally stores itself as the global server if `init_anubis` hasn't run. Supports `target <url>` and `policy_file <path>`.
+- **`AnubisMiddleware`** - Creates its own Anubis server per-instance with the correct Caddy passthrough (via `context.WithValue`). Sets `X-Real-IP` from the peer address when absent (Anubis requires the header and trusts it unconditionally). Each instance keeps its own challenge store, so `/.within.website/` API requests (`pass-challenge` etc.) are delegated to the middleware server that issued the challenge (`serveAnubisAPI`); static assets stay on the global server. Optionally stores itself as the global server if `init_anubis` hasn't run. Supports `target <url>` and `policy_file <path>`.
 - **`anubisStaticMiddleware`** - Backward compatibility handler that delegates `/.within.website/` to the global Anubis server.
 
 The global Anubis server is shared via `sync/atomic.Pointer[libanubis.Server]`.

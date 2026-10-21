@@ -1,8 +1,10 @@
 package caddyanubis
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -26,6 +28,113 @@ var anubisServer atomic.Pointer[libanubis.Server]
 // nextHandlerCtxKey is used to pass the Caddy next handler through the
 // request context, avoiding shared mutable state on the middleware struct.
 type nextHandlerCtxKey struct{}
+
+// anubisAPIServers lists the Anubis servers provisioned by anubis
+// middleware instances. Each instance keeps its own in-memory challenge
+// store, so a challenge issued by one server can only be verified by that
+// same server. The init_anubis route owns /.within.website/* (including the
+// pass-challenge API), so API requests are delegated to the middleware
+// servers instead of being answered by the global server.
+var anubisAPIServers atomic.Pointer[[]*libanubis.Server]
+
+func registerAPIServer(s *libanubis.Server) {
+	for {
+		old := anubisAPIServers.Load()
+		next := []*libanubis.Server{s}
+		if old != nil {
+			next = append(next, *old...)
+		}
+		if anubisAPIServers.CompareAndSwap(old, &next) {
+			return
+		}
+	}
+}
+
+// bufferedResponseWriter captures a response so a challenge-store miss can
+// be detected before anything is sent to the client.
+type bufferedResponseWriter struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func (b *bufferedResponseWriter) Header() http.Header {
+	if b.header == nil {
+		b.header = http.Header{}
+	}
+	return b.header
+}
+
+func (b *bufferedResponseWriter) Write(p []byte) (int, error) { return b.body.Write(p) }
+
+func (b *bufferedResponseWriter) WriteHeader(code int) { b.status = code }
+
+// miss reports whether the response is the "getChallenge failed" error that
+// Anubis returns when the challenge id is not in this server's store.
+func (b *bufferedResponseWriter) miss() bool {
+	return b.status == http.StatusInternalServerError &&
+		bytes.Contains(b.body.Bytes(), []byte("getChallenge failed"))
+}
+
+func (b *bufferedResponseWriter) copyTo(w http.ResponseWriter) {
+	dst := w.Header()
+	for k, vs := range b.header {
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+	if b.status != 0 {
+		w.WriteHeader(b.status)
+	}
+	_, _ = w.Write(b.body.Bytes())
+}
+
+// serveAnubisAPI answers an Anubis API request with the first server whose
+// challenge store holds the challenge. preferred is tried first; the
+// remaining registered middleware servers are tried as fallbacks.
+func serveAnubisAPI(w http.ResponseWriter, r *http.Request, preferred *libanubis.Server) bool {
+	servers := make([]*libanubis.Server, 0, 2)
+	if preferred != nil {
+		servers = append(servers, preferred)
+	}
+	if p := anubisAPIServers.Load(); p != nil {
+		for _, s := range *p {
+			if s != nil && s != preferred {
+				servers = append(servers, s)
+			}
+		}
+	}
+	if len(servers) == 0 {
+		return false
+	}
+
+	var body []byte
+	if r.Body != nil && r.Body != http.NoBody {
+		body, _ = io.ReadAll(r.Body)
+		r.Body.Close()
+	}
+
+	var last *bufferedResponseWriter
+	for _, s := range servers {
+		rr := r.Clone(r.Context())
+		if body != nil {
+			rr.Body = io.NopCloser(bytes.NewReader(body))
+		} else {
+			rr.Body = http.NoBody
+		}
+		buf := &bufferedResponseWriter{}
+		s.ServeHTTP(buf, rr)
+		if !buf.miss() {
+			buf.copyTo(w)
+			return true
+		}
+		last = buf
+	}
+	if last != nil {
+		last.copyTo(w)
+	}
+	return true
+}
 
 func init() {
 	caddy.RegisterModule(AnubisMiddleware{})
@@ -90,6 +199,7 @@ func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 	// If init_anubis has not provisioned a global server yet, store ours
 	// so that static asset routes can delegate to it.
 	anubisServer.CompareAndSwap(nil, m.anubisServer)
+	registerAPIServer(m.anubisServer)
 	m.logger.Info("anubis middleware provisioned")
 	return nil
 }
@@ -119,6 +229,12 @@ func ensureRealIP(r *http.Request) {
 
 func (m *AnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	ensureRealIP(r)
+	if strings.HasPrefix(r.URL.Path, anubis.APIPrefix) {
+		r.RequestURI = r.URL.RequestURI()
+		if serveAnubisAPI(w, r, m.anubisServer) {
+			return nil
+		}
+	}
 	ctx := context.WithValue(r.Context(), nextHandlerCtxKey{}, next)
 	m.anubisServer.ServeHTTP(w, r.WithContext(ctx))
 	return nil
@@ -167,12 +283,15 @@ func (anubisStaticMiddleware) CaddyModule() caddy.ModuleInfo {
 func (anubisStaticMiddleware) Provision(caddy.Context) error { return nil }
 func (anubisStaticMiddleware) Validate() error               { return nil }
 
-func (anubisStaticMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+func (m anubisStaticMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	srv := anubisServer.Load()
 	if srv == nil || !strings.HasPrefix(r.URL.Path, "/.within.website/") {
 		return next.ServeHTTP(w, r)
 	}
 	r.RequestURI = r.URL.RequestURI()
+	if strings.HasPrefix(r.URL.Path, anubis.APIPrefix) && serveAnubisAPI(w, r, srv) {
+		return nil
+	}
 	srv.ServeHTTP(w, r)
 	return nil
 }
@@ -239,6 +358,9 @@ func (m *initAnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request,
 	if strings.HasPrefix(r.URL.Path, "/.within.website/") {
 		ensureRealIP(r)
 		r.RequestURI = r.URL.RequestURI()
+		if strings.HasPrefix(r.URL.Path, anubis.APIPrefix) && serveAnubisAPI(w, r, m.anubisServer) {
+			return nil
+		}
 		m.anubisServer.ServeHTTP(w, r)
 		return nil
 	}
