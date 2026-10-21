@@ -58,7 +58,8 @@ func (AnubisMiddleware) CaddyModule() caddy.ModuleInfo {
 func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger().Named("anubis")
 
-	pol, err := libanubis.LoadPoliciesOrDefault(ctx, m.PolicyFile, anubis.DefaultDifficulty, "info")
+	// subrequestMode matches upstream: true when no target redirects.
+	pol, err := libanubis.LoadPoliciesOrDefault(ctx, m.PolicyFile, anubis.DefaultDifficulty, "info", m.Target == nil)
 	if err != nil {
 		return err
 	}
@@ -185,7 +186,8 @@ func (initAnubisMiddleware) CaddyModule() caddy.ModuleInfo {
 func (m *initAnubisMiddleware) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger().Named("init_anubis")
 
-	pol, err := libanubis.LoadPoliciesOrDefault(ctx, m.PolicyFile, anubis.DefaultDifficulty, "info")
+	// init_anubis has no target, so subrequestMode is always true.
+	pol, err := libanubis.LoadPoliciesOrDefault(ctx, m.PolicyFile, anubis.DefaultDifficulty, "info", true)
 	if err != nil {
 		return err
 	}

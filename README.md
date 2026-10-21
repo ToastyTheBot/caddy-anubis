@@ -7,23 +7,49 @@ A Caddy plugin that integrates [Anubis](https://github.com/TecharoHQ/anubis) pro
 Build Caddy with this plugin using xcaddy:
 
 ```bash
-GOPRIVATE=github.com/ToastyTheBot/* xcaddy build --with github.com/ToastyTheBot/caddy-anubis
+xcaddy build --with github.com/ToastyTheBot/caddy-anubis
 ```
 
 ## Usage
 
-Add `anubis` to your Caddyfile. It works both at the top level and inside `route`/`handle` blocks:
+Two directives are available:
+
+- **`init_anubis`** — server-level directive that provisions the Anubis server and serves static challenge assets at `/.within.website/`. Place once per server block, outside any `handle` blocks.
+- **`anubis`** — handler-level middleware that protects specific paths. Use inside `handle` blocks to protect root or subdirectory paths.
+
+### Recommended Setup
 
 ```caddy
-:80 {
+:8080 {
+    init_anubis          # Global: provisions server + serves static assets
+
     handle {
-        anubis
-        reverse_proxy localhost:8080
+        anubis           # Protect all paths under this handler
+        file_server
     }
 }
 ```
 
-### Options
+### Path-Scoped Protection
+
+Protect only specific paths while leaving others public:
+
+```caddy
+:8080 {
+    init_anubis
+
+    handle /admin/* {
+        anubis
+        respond "Admin area"
+    }
+
+    handle {
+        respond "Public page"
+    }
+}
+```
+
+### `anubis` Options
 
 ```caddy
 anubis {

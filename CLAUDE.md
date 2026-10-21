@@ -12,7 +12,7 @@ This is a **Caddy HTTP server module** that integrates [Anubis](https://github.c
 ## Key Dependencies
 
 - **Caddy v2** (`github.com/caddyserver/caddy/v2`) - The host server framework.
-- **Anubis fork** (`github.com/ToastyTheBot/anubis`) - Fork of upstream Anubis with generated frontend assets checked in. Module path rewritten from `TecharoHQ` to `ToastyTheBot`. Uses matching upstream tags (e.g., `v1.25.0`).
+- **Anubis fork** (`github.com/ToastyTheBot/anubis`) - Fork of upstream Anubis with generated frontend assets checked in. Module path rewritten from `TecharoHQ` to `ToastyTheBot`. **Fork tags must always match upstream tags exactly** — the fork is the same version, just with build assets committed. Never suggest bumping to a new patch version (e.g., `v1.25.1`) to work around module proxy cache issues; resolve those through cache cleaning or `GOPROXY=direct` instead.
 
 ## Architecture
 
@@ -44,25 +44,45 @@ The global Anubis server is shared via `sync/atomic.Pointer[libanubis.Server]`.
 
 ## Build and Run
 
-### Prerequisites
-
-```bash
-export GOPRIVATE=github.com/ToastyTheBot/*
-export GONOSUMCHECK=github.com/ToastyTheBot/*,all
-export GONOSUMDB=github.com/ToastyTheBot/*
-```
-
 ### Build Caddy with Plugin
 
-The standard `xcaddy build` may fail due to Go module cache holding stale `TecharoHQ` module paths for the forked Anubis tag. Working build process:
+No Go environment overrides are needed. The fork publishes complete module
+versions (compiled frontend assets committed by the `upstream-sync` workflow
+in the anubis fork), so the module proxy serves them like any other module:
+
+```bash
+xcaddy build --with github.com/ToastyTheBot/caddy-anubis
+```
+
+If a build ever fails with `module declares its path as github.com/TecharoHQ/anubis`
+or a `go:embed` "no matching files" error, the proxy cached an incomplete copy
+of that anubis version. Fix the fork tag (assets must be committed:
+`web/static/**`, `lib/challenge/**/static/**`, `xess/static/**`), then require
+a version the proxy has not cached yet. Do not paper over it with GOPRIVATE
+or GONOPROXY in consumer docs or CI.
+
+For local fork development, a manual build is still available:
 
 1. Clone the fork: `git clone https://github.com/ToastyTheBot/anubis /tmp/anubis-fork`
-2. Create a temp build dir with `main.go` (imports `github.com/ToastyTheBot/caddy-anubis`) and `go.mod` containing both replace directives:
+2. Create a temp build dir with `main.go` and `go.mod`:
+   ```go
+   // main.go
+   package main
+   import (
+       _ "github.com/ToastyTheBot/caddy-anubis"
+       _ "github.com/caddyserver/caddy/v2/modules/standard"
+       caddycmd "github.com/caddyserver/caddy/v2/cmd"
+   )
+   func main() { caddycmd.Main() }
+   ```
+   `go.mod` must include both replace directives:
    ```
    replace github.com/ToastyTheBot/caddy-anubis => /path/to/caddy-anubis
    replace github.com/ToastyTheBot/anubis => /tmp/anubis-fork
    ```
 3. Run `go mod tidy` then `go build -o caddy -tags nobadger,nomysql,nopgx -trimpath .`
+
+**Note:** Importing `modules/standard` is required for standard Caddy directives like `request_header` to work.
 
 ### Run with the Local Caddyfile
 
