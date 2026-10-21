@@ -17,11 +17,12 @@ Two directives are available:
 - **`init_anubis`** — server-level directive that provisions the Anubis server and serves static challenge assets at `/.within.website/`. Place once per server block, outside any `handle` blocks.
 - **`anubis`** — handler-level middleware that protects specific paths. Use inside `handle` blocks to protect root or subdirectory paths.
 
+The `anubis` middleware sets `X-Real-IP` from the peer address when the request has none; Anubis requires that header. When Caddy runs behind another proxy or TLS terminator, set `X-Real-IP` in that front proxy — Anubis trusts the header unconditionally.
+
 ### Recommended Setup
 
 ```caddy
 :8080 {
-    request_header X-Real-IP {remote_host}   # Anubis requires the client IP header
     init_anubis          # Global: provisions server + serves static assets
 
     handle {
@@ -37,7 +38,6 @@ Protect only specific paths while leaving others public:
 
 ```caddy
 :8080 {
-    request_header X-Real-IP {remote_host}
     init_anubis
 
     handle /admin/* {

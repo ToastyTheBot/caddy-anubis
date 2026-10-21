@@ -3,6 +3,7 @@ package caddyanubis
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -95,7 +96,29 @@ func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 
 func (m *AnubisMiddleware) Validate() error { return nil }
 
+// ensureRealIP sets X-Real-IP from the peer address when it is absent.
+// Anubis requires the header (lib/anubis.go check()) and trusts it blindly,
+// which is the contract for its reverse proxy; this plugin is that proxy.
+// A value set upstream (request_header directive or a trusted proxy) wins.
+func ensureRealIP(r *http.Request) {
+	if r.Header.Get("X-Real-IP") != "" {
+		return
+	}
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	// Strip the IPv6 zone so anubis can parse the address.
+	if i := strings.IndexByte(host, '%'); i >= 0 {
+		host = host[:i]
+	}
+	if host != "" {
+		r.Header.Set("X-Real-IP", host)
+	}
+}
+
 func (m *AnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	ensureRealIP(r)
 	ctx := context.WithValue(r.Context(), nextHandlerCtxKey{}, next)
 	m.anubisServer.ServeHTTP(w, r.WithContext(ctx))
 	return nil
@@ -214,6 +237,7 @@ func (initAnubisMiddleware) Validate() error { return nil }
 
 func (m *initAnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	if strings.HasPrefix(r.URL.Path, "/.within.website/") {
+		ensureRealIP(r)
 		r.RequestURI = r.URL.RequestURI()
 		m.anubisServer.ServeHTTP(w, r)
 		return nil
