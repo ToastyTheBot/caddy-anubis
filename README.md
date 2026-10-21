@@ -21,7 +21,7 @@ Two directives are available:
 
 ```caddy
 :8080 {
-    request_header +X-Real-IP {remote_host}   # Anubis requires the client IP header
+    request_header X-Real-IP {remote_host}   # Anubis requires the client IP header
     init_anubis          # Global: provisions server + serves static assets
 
     handle {
@@ -37,7 +37,7 @@ Protect only specific paths while leaving others public:
 
 ```caddy
 :8080 {
-    request_header +X-Real-IP {remote_host}
+    request_header X-Real-IP {remote_host}
     init_anubis
 
     handle /admin/* {
