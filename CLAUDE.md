@@ -28,6 +28,7 @@ The global Anubis server is shared via `sync/atomic.Pointer[libanubis.Server]`.
 
 ```caddy
 :8080 {
+    request_header +X-Real-IP {remote_host}   # Anubis requires the client IP header
     init_anubis          # Global: provisions server + serves static assets
 
     handle /admin/* {
