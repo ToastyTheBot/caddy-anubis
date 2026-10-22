@@ -69,6 +69,23 @@ func unregisterAPIServer(s *libanubis.Server) {
 	}
 }
 
+// releaseGlobalServer clears the global server pointer when it still points
+// at s and re-points it at any remaining registered middleware server, so a
+// reload that drops init_anubis does not strand the static handler on an
+// unprovisioned server.
+func releaseGlobalServer(s *libanubis.Server) {
+	if !anubisServer.CompareAndSwap(s, nil) {
+		return
+	}
+	if p := anubisAPIServers.Load(); p != nil {
+		for _, other := range *p {
+			if other != nil && anubisServer.CompareAndSwap(nil, other) {
+				return
+			}
+		}
+	}
+}
+
 // bufferedResponseWriter captures a response so a challenge-store miss can
 // be detected before anything is sent to the client.
 type bufferedResponseWriter struct {
@@ -242,11 +259,14 @@ func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 func (m *AnubisMiddleware) Validate() error { return nil }
 
 // Cleanup removes this instance's server from the API delegation registry
-// so reloaded configs do not accumulate stale servers.
+// and releases the global pointer when it still points at this server, so
+// reloaded configs neither accumulate stale servers nor strand static assets.
 func (m *AnubisMiddleware) Cleanup() error {
-	if m.anubisServer != nil {
-		unregisterAPIServer(m.anubisServer)
+	if m.anubisServer == nil {
+		return nil
 	}
+	unregisterAPIServer(m.anubisServer)
+	releaseGlobalServer(m.anubisServer)
 	return nil
 }
 
@@ -402,6 +422,16 @@ func (m *initAnubisMiddleware) Provision(ctx caddy.Context) error {
 
 func (initAnubisMiddleware) Validate() error { return nil }
 
+// Cleanup releases the global server pointer when it still points at this
+// instance's server, so a reload that drops init_anubis leaves no dangling
+// global for the static handler to delegate to.
+func (m *initAnubisMiddleware) Cleanup() error {
+	if m.anubisServer != nil {
+		releaseGlobalServer(m.anubisServer)
+	}
+	return nil
+}
+
 func (m *initAnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	if strings.HasPrefix(r.URL.Path, "/.within.website/") {
 		ensureRealIP(r)
@@ -452,7 +482,10 @@ func parseInitAnubis(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 		}
 	}
 
-	mod, _ := caddy.GetModule("http.handlers.init_anubis")
+	mod, err := caddy.GetModule("http.handlers.init_anubis")
+	if err != nil {
+		return nil, err
+	}
 	var warnings []caddyconfig.Warning
 	jsonObj := caddyconfig.JSONModuleObject(m, "handler", mod.ID.Name(), &warnings)
 
@@ -482,4 +515,5 @@ var (
 	_ caddy.Validator             = (*initAnubisMiddleware)(nil)
 	_ caddyhttp.MiddlewareHandler = (*initAnubisMiddleware)(nil)
 	_ caddyfile.Unmarshaler       = (*initAnubisMiddleware)(nil)
+	_ caddy.CleanerUpper          = (*initAnubisMiddleware)(nil)
 )
