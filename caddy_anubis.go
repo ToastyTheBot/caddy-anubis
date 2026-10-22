@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -50,6 +51,24 @@ func registerAPIServer(s *libanubis.Server) {
 	}
 }
 
+func unregisterAPIServer(s *libanubis.Server) {
+	for {
+		old := anubisAPIServers.Load()
+		if old == nil {
+			return
+		}
+		next := make([]*libanubis.Server, 0, len(*old))
+		for _, x := range *old {
+			if x != s {
+				next = append(next, x)
+			}
+		}
+		if anubisAPIServers.CompareAndSwap(old, &next) {
+			return
+		}
+	}
+}
+
 // bufferedResponseWriter captures a response so a challenge-store miss can
 // be detected before anything is sent to the client.
 type bufferedResponseWriter struct {
@@ -69,11 +88,16 @@ func (b *bufferedResponseWriter) Write(p []byte) (int, error) { return b.body.Wr
 
 func (b *bufferedResponseWriter) WriteHeader(code int) { b.status = code }
 
-// miss reports whether the response is the "getChallenge failed" error that
-// Anubis returns when the challenge id is not in this server's store.
-func (b *bufferedResponseWriter) miss() bool {
-	return b.status == http.StatusInternalServerError &&
-		bytes.Contains(b.body.Bytes(), []byte("getChallenge failed"))
+// miss reports whether this server failed to answer because it did not hold
+// the challenge: either the explicit "getChallenge failed" store error, or
+// any 500 while the client lacks the verification cookie (the server that
+// holds the challenge retries with a fresh challenge instead of erroring,
+// so a 500 from a server without the challenge must not be copied).
+func (b *bufferedResponseWriter) miss(noTestCookie bool) bool {
+	if b.status != http.StatusInternalServerError {
+		return false
+	}
+	return noTestCookie || bytes.Contains(b.body.Bytes(), []byte("getChallenge failed"))
 }
 
 func (b *bufferedResponseWriter) copyTo(w http.ResponseWriter) {
@@ -114,24 +138,35 @@ func serveAnubisAPI(w http.ResponseWriter, r *http.Request, preferred *libanubis
 		r.Body.Close()
 	}
 
-	var last *bufferedResponseWriter
+	// Without the verification cookie the lib consults its own store before
+	// deciding between the cookies-disabled error and a retry redirect, so a
+	// 500 from a server that lacks the challenge is indistinguishable from
+	// the real error; treat it as a miss and let the holder answer.
+	_, cookieErr := r.Cookie(anubis.TestCookieName)
+	noTestCookie := errors.Is(cookieErr, http.ErrNoCookie)
+
+	var first *bufferedResponseWriter
 	for _, s := range servers {
 		rr := r.Clone(r.Context())
 		if body != nil {
 			rr.Body = io.NopCloser(bytes.NewReader(body))
+			rr.ContentLength = int64(len(body))
 		} else {
 			rr.Body = http.NoBody
+			rr.ContentLength = 0
 		}
 		buf := &bufferedResponseWriter{}
 		s.ServeHTTP(buf, rr)
-		if !buf.miss() {
+		if !buf.miss(noTestCookie) {
 			buf.copyTo(w)
 			return true
 		}
-		last = buf
+		if first == nil {
+			first = buf
+		}
 	}
-	if last != nil {
-		last.copyTo(w)
+	if first != nil {
+		first.copyTo(w)
 	}
 	return true
 }
@@ -206,6 +241,15 @@ func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 
 func (m *AnubisMiddleware) Validate() error { return nil }
 
+// Cleanup removes this instance's server from the API delegation registry
+// so reloaded configs do not accumulate stale servers.
+func (m *AnubisMiddleware) Cleanup() error {
+	if m.anubisServer != nil {
+		unregisterAPIServer(m.anubisServer)
+	}
+	return nil
+}
+
 // ensureRealIP sets X-Real-IP from the peer address when it is absent.
 // Anubis requires the header (lib/anubis.go check()) and trusts it blindly,
 // which is the contract for its reverse proxy; this plugin is that proxy.
@@ -264,7 +308,9 @@ func (m *AnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 func parseAnubis(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var m AnubisMiddleware
-	m.UnmarshalCaddyfile(h.Dispenser)
+	if err := m.UnmarshalCaddyfile(h.Dispenser); err != nil {
+		return nil, err
+	}
 	return &m, nil
 }
 
@@ -303,7 +349,9 @@ func (anubisStaticMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 func parseAnubisStatic(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var m anubisStaticMiddleware
-	m.UnmarshalCaddyfile(h.Dispenser)
+	if err := m.UnmarshalCaddyfile(h.Dispenser); err != nil {
+		return nil, err
+	}
 	return m, nil
 }
 
@@ -429,6 +477,7 @@ var (
 	_ caddy.Validator             = (*AnubisMiddleware)(nil)
 	_ caddyhttp.MiddlewareHandler = (*AnubisMiddleware)(nil)
 	_ caddyfile.Unmarshaler       = (*AnubisMiddleware)(nil)
+	_ caddy.CleanerUpper          = (*AnubisMiddleware)(nil)
 	_ caddy.Provisioner           = (*initAnubisMiddleware)(nil)
 	_ caddy.Validator             = (*initAnubisMiddleware)(nil)
 	_ caddyhttp.MiddlewareHandler = (*initAnubisMiddleware)(nil)
