@@ -63,6 +63,15 @@ anubis {
 }
 ```
 
+## Automated updates
+
+Renovate runs daily from `.github/workflows/renovate.yml` and opens pull
+requests to bump `github.com/ToastyTheBot/anubis`, Caddy, and GitHub
+Actions. It needs a repository secret `RENOVATE_TOKEN`: a fine-grained PAT
+with Contents, Pull requests, and Workflows write access. If you install the
+Renovate GitHub App on the repository instead, delete the workflow; the
+`renovate.json` config works for both.
+
 ## Credits
 
 - [Anubis](https://github.com/TecharoHQ/anubis) - the proof-of-work challenge engine.
