@@ -1,18 +1,11 @@
 module github.com/ToastyTheBot/caddy-anubis
 
-go 1.26.3
+go 1.27.3
 
 require (
-	github.com/ToastyTheBot/anubis v1.28.1
+	github.com/ToastyTheBot/anubis v1.28.2
 	github.com/caddyserver/caddy/v2 v2.11.2
 	go.uber.org/zap v1.27.1
-)
-
-require (
-	github.com/a-h/templ v0.3.1070 // indirect
-	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
-	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/sebest/xff v0.0.0-20210106013422-671bd2870b3a // indirect
 )
 
 require (
@@ -29,6 +22,7 @@ require (
 	github.com/Masterminds/goutils v1.1.1 // indirect
 	github.com/Masterminds/semver/v3 v3.4.0 // indirect
 	github.com/Masterminds/sprig/v3 v3.3.0 // indirect
+	github.com/a-h/templ v0.3.1070 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
 	github.com/aryann/difflib v0.0.0-20210328193216-ff5ff6dc229b // indirect
 	github.com/aws/aws-sdk-go-v2 v1.47.1 // indirect
@@ -78,6 +72,7 @@ require (
 	github.com/go-sql-driver/mysql v1.8.1 // indirect
 	github.com/gobwas/glob v0.2.3 // indirect
 	github.com/gofrs/flock v0.13.1 // indirect
+	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/cel-go v0.28.1 // indirect
@@ -106,6 +101,7 @@ require (
 	github.com/mitchellh/copystructure v1.2.0 // indirect
 	github.com/mitchellh/go-ps v1.0.0 // indirect
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nicksnyder/go-i18n/v2 v2.6.1 // indirect
 	github.com/nikandfor/spintax v0.0.0-20181023094358-fc346b245bb3 // indirect
 	github.com/oschwald/maxminddb-golang/v2 v2.7.0 // indirect
@@ -121,6 +117,7 @@ require (
 	github.com/redis/go-redis/v9 v9.22.0 // indirect
 	github.com/rs/xid v1.6.0 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
+	github.com/sebest/xff v0.0.0-20210106013422-671bd2870b3a // indirect
 	github.com/shirou/gopsutil/v4 v4.26.9 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/shurcooL/sanitized_anchor_name v1.0.0 // indirect
