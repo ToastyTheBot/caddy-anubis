@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 
@@ -188,7 +189,40 @@ func serveAnubisAPI(w http.ResponseWriter, r *http.Request, preferred *libanubis
 	return true
 }
 
+// stampVersion replaces Anubis' "devel" version string with the module
+// versions this binary was compiled with, e.g. "v1.28.2-v1.0.5", so the
+// challenge page footer reflects the pinned releases. An xcaddy build has
+// no ldflags, and Anubis only reads its own main module's version, which is
+// Caddy's here.
+func stampVersion() {
+	if anubis.Version != "devel" {
+		return
+	}
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return
+	}
+	var anubisV, pluginV string
+	for _, d := range bi.Deps {
+		switch d.Path {
+		case "github.com/ToastyTheBot/anubis":
+			anubisV = d.Version
+		case "github.com/ToastyTheBot/caddy-anubis":
+			pluginV = d.Version
+		}
+	}
+	if anubisV == "" || anubisV == "(devel)" {
+		return
+	}
+	if pluginV == "" || pluginV == "(devel)" {
+		anubis.Version = anubisV
+		return
+	}
+	anubis.Version = anubisV + "-" + pluginV
+}
+
 func init() {
+	stampVersion()
 	caddy.RegisterModule(AnubisMiddleware{})
 	caddy.RegisterModule(anubisStaticMiddleware{})
 	caddy.RegisterModule(initAnubisMiddleware{})
