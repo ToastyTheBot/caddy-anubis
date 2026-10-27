@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a **Caddy HTTP server module** that integrates [Anubis](https://github.com/TecharoHQ/anubis) proof-of-work challenges to protect upstream resources from scraper bots and AI crawlers. It provides one Caddyfile directive, `anubis`, usable in two positions:
 
-- **Top level of a site block** - Provisions the shared Anubis server and serves static assets at `/.within.website/`. Place once per site. With `protect` it also challenges every non-static request.
-- **Inside `handle`/`route` blocks** - Middleware that challenges the block's requests. All instances share one Anubis server, so a solved challenge verifies in every block.
+- **Top level of a site block** - Provisions the shared site Anubis server, serves static assets at `/.within.website/`, and records its `policy_file` as the site default policy. Place once per site, before the handle blocks. With `protect` it also challenges every non-static request.
+- **Inside `handle`/`route` blocks** - Middleware gate. Each block provisions its **own** Anubis server (challenge store, signing key, per-gate cookie names), so gates are independent: clearing one neither auto-validates another nor overwrites its clearance. Accepts `policy_file` (default: the site policy) and `target`.
 
 ## Key Dependencies
 
@@ -18,9 +18,11 @@ This is a **Caddy HTTP server module** that integrates [Anubis](https://github.c
 
 The entire plugin is a single Go file: `caddy_anubis.go`. One module, `AnubisMiddleware` (`http.handlers.anubis`), backs the unified directive; `RegisterDirective("anubis", parseAnubis)` serves both positions and `inHandleBlock` (Helper `State` vs `BlockState` map identity, requires caddy >= v2.11.7, pinned by adapt tests) picks the flavor:
 
-- **Top-level flavor** - `authoritative:true` instances provision the shared Anubis server (`Store`) with `policy_file`/`target`/`protect`, and emit routes: the static route (`/.within.website/*`, `protect:false`) plus, with `protect`, a catch-all or matcher-scoped challenge route (inline `/x` or named `@m` matcher tokens supported).
-- **Handle-block flavor** - `protect:true`, non-authoritative, no Caddyfile options (`policy_file`/`target` error and point at the top-level directive). Challenges the enclosing block; next handler is passed to Anubis via `context.WithValue(nextHandlerCtxKey)`.
-- **Shared server** - every instance serves through `anubisServer atomic.Pointer[libanubis.Server]`; handle-block instances `CompareAndSwap` in a default server when none exists, the top-level instance `Store`s the authoritative one. One challenge store and session key site-wide. `liveServers` lets cleanup re-point the global at a survivor. `ensureRealIP` sets `X-Real-IP` from the peer when absent (Anubis requires and trusts it).
+- **Top-level flavor** - `authoritative:true` instances provision the site Anubis server (`Store` into `anubisServer atomic.Pointer[libanubis.Server]`) with `policy_file`/`target`/`protect`, record `policy_file` in Helper `State` (`statePolicyKey`) as the site default, and emit routes: the static route (`/.within.website/*`, `protect:false`) plus, with `protect`, a catch-all or matcher-scoped challenge route (inline `/x` or named `@m` matcher tokens supported). Site instances use the base Anubis cookie names (`cookieID ""`).
+- **Handle-block flavor** - always provisions a dedicated `libanubis.Server` (never touches the global pointer). Policy = own `policy_file` or the site default from State; `target` is per-gate. `cookieID = sha256(policyFile|target)[:8]` and the instance registers in the `apiGates` registry.
+- **Per-gate cookie renaming** - the lib uses fixed cookie names (`techaro.lol-anubis*`), so two gates would overwrite each other's clearances in one browser. Gate instances wrap the writer (`gateCookieWriter`: renames `Set-Cookie` to `<base>__<cookieID>` at WriteHeader) and the request (`renameRequestCookies`: maps `<base>__<cookieID>` back to `<base>` and drops other gates' cookies) around `server.ServeHTTP`.
+- **API dispatch** - the pass-challenge/honeypot API lives under `anubis.APIPrefix` inside the static route. `serveAPI` picks candidate gates by renamed-cookie presence, serves each with a buffered writer, and confirms ownership with miss detection (500 "getChallenge failed" / missing test cookie after rename); it falls back to all gates then the global server. Dispatched `Set-Cookie` headers are renamed to the issuing gate's names before copy-out.
+- **Shared pieces** - static assets are served from the global server, falling back to the instance's own. `releaseGlobalServer` re-points the global at a surviving gate when the authoritative instance cleans up. `ensureRealIP` sets `X-Real-IP` from the peer when absent (Anubis requires and trusts it); `ServeHTTP` restores `RequestURI`. Next handler is passed to Anubis via `context.WithValue(nextHandlerCtxKey)`.
 - **`anubisStaticMiddleware`** - Backward compatibility handler that delegates `/.within.website/` to the global Anubis server.
 
 ### Caddyfile Example
@@ -89,7 +91,7 @@ For local fork development, a manual build is still available:
 ./caddy run --config Caddyfile
 ```
 
-The local Caddyfile serves on `:8080` with top-level `anubis` plus `anubis` in a `handle` block, falling back to `web/` file server.
+The local Caddyfile serves on `:8080`: top-level `anubis` with `protect off` plus `policy_file tests/testdata/challenge.yaml` (static assets + site default policy), an independent gate on `/admin/*` with `tests/testdata/challenge2.yaml`, and a root gate inheriting the site policy in front of the `web/` file server.
 
 ## Git Identity
 
@@ -105,4 +107,4 @@ git -c user.name="Claude Mythos" -c user.email=noreply@anthropic.com commit -m "
 
 The Anubis fork has its own **upstream-sync.yml** workflow that fetches upstream release tags, builds frontend assets, and pushes tagged commits to the fork.
 
-Tests live in `tests/` (`go test ./tests/`): `adapt_test.go` covers the Caddyfile adapter for both directive positions; `serve_test.go` covers ServeHTTP behavior (challenge/pass/deny/target/static/shared server) against `testdata/*.yaml` policies. `go vet ./...` is the static check.
+Tests live in `tests/` (`go test ./tests/`): `adapt_test.go` covers the Caddyfile adapter for both directive positions (gate options, site-policy inheritance, error cases); `serve_test.go` covers ServeHTTP behavior (independent gates, per-gate cookie isolation, API dispatch to the issuing gate, chained target short-circuit, challenge/pass/deny/static, global cleanup re-pointing) against `testdata/*.yaml` policies. `go vet ./...` is the static check.

@@ -311,21 +311,80 @@ func TestAdaptMultipleHandleBlocks(t *testing.T) {
 	}
 }
 
-// Site-wide options are rejected inside handle blocks with a clear error.
-func TestAdaptHandleBlockRejectsSiteOptions(t *testing.T) {
+// Handle-block gates accept their own policy_file and target.
+func TestAdaptHandleBlockGateOptions(t *testing.T) {
+	routes := adapt(t, `:8080 {
+	handle /a {
+		anubis {
+			policy_file /tmp/a.yaml
+			target https://example.com/done
+		}
+		respond "a"
+	}
+}`)
+	hs := handlersOf(routes[0])
+	if len(hs) != 2 || hs[0].Handler != "anubis" {
+		t.Fatalf("want anubis first, got %+v", hs)
+	}
+	if hs[0].PolicyFile != "/tmp/a.yaml" || hs[0].Target == nil || *hs[0].Target != "https://example.com/done" {
+		t.Errorf("block options not stored: %+v", hs[0])
+	}
+	if hs[0].Authoritative {
+		t.Errorf("handle-block flavor must not be authoritative: %+v", hs[0])
+	}
+}
+
+// A block without policy_file inherits the top-level directive's policy
+// through the shared server-block state.
+func TestAdaptBlockInheritsSitePolicy(t *testing.T) {
+	routes := adapt(t, `:8080 {
+	anubis {
+		policy_file /etc/anubis/site.yaml
+	}
+	handle /a {
+		anubis
+		respond "a"
+	}
+}`)
+	blocked := routes[1]
+	hs := handlersOf(blocked)
+	if hs[0].Handler != "anubis" {
+		t.Fatalf("want anubis first, got %+v", hs)
+	}
+	if hs[0].PolicyFile != "/etc/anubis/site.yaml" {
+		t.Errorf("block must inherit site policy_file, got %+v", hs[0])
+	}
+	if hs[0].Authoritative {
+		t.Errorf("block flavor must not be authoritative: %+v", hs[0])
+	}
+}
+
+// Unknown options inside a handle-block gate still fail adaptation.
+func TestAdaptHandleBlockRejectsUnknownOption(t *testing.T) {
 	adapter := caddyconfig.GetAdapter("caddyfile")
 	_, _, err := adapter.Adapt([]byte(`:8080 {
 	handle /a {
 		anubis {
-			policy_file /tmp/p.yaml
+			policyfile /tmp/p.yaml
 		}
 		respond "a"
 	}
 }`), map[string]any{"server_type": "http"})
 	if err == nil {
-		t.Fatal("policy_file inside handle block must fail adaptation")
+		t.Fatal("unknown option inside handle block must fail adaptation")
 	}
-	if !strings.Contains(err.Error(), "top-level") {
-		t.Fatalf("error must point at the top-level directive, got: %v", err)
+}
+
+// Options without a block at top level fail with a pointer to the block form.
+func TestAdaptTopLevelRequiresBlockForOptions(t *testing.T) {
+	adapter := caddyconfig.GetAdapter("caddyfile")
+	_, _, err := adapter.Adapt([]byte(`:8080 {
+	anubis policy_file /tmp/p.yaml
+}`), map[string]any{"server_type": "http"})
+	if err == nil {
+		t.Fatal("top-level options without a block must fail adaptation")
+	}
+	if !strings.Contains(err.Error(), "block") {
+		t.Fatalf("error must mention the block form, got: %v", err)
 	}
 }

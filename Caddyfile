@@ -1,17 +1,31 @@
 {
-	# No global order override needed; anubis registers itself after templates.
+	# No global order override needed; anubis registers itself after "invoke".
 }
 
 :8080 {
-	request_header X-Real-IP {remote_host}
+	request_header +X-Real-IP {remote_host}
 	request_header +X-Forwarded-For {remote_host}
 
-	# Provisions the shared Anubis server and serves static assets at /.within.website/
-	anubis
+	# Site-wide: provisions the shared static-asset route and the default
+	# policy that handle-block gates inherit. "protect off" leaves the
+	# gating to the blocks below. Place once per site, before the blocks.
+	anubis {
+		protect off
+		policy_file tests/testdata/challenge.yaml
+	}
+
+	handle /admin/* {
+		# Independent gate: its own challenge store, signing key and cookie
+		# names, so clearing it never touches the gate below (or vice versa).
+		anubis {
+			policy_file tests/testdata/challenge2.yaml
+		}
+		respond "admin-area"
+	}
 
 	handle {
+		# Second gate guarding the file server; inherits the site policy.
 		anubis
-
 		try_files {path} /index.html
 		file_server {
 			root web/

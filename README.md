@@ -14,8 +14,10 @@ xcaddy build --with github.com/ToastyTheBot/caddy-anubis
 
 One directive, `anubis`, used in two positions:
 
-- **Top level of a site block** — provisions the shared Anubis server and serves the static challenge assets under `/.within.website/`. Place it once per site, outside any `handle` block. With its `protect` option it also challenges every non-static request and, on success, continues to the rest of the site, so one directive is enough to protect a whole site.
-- **Inside `handle` (or `route`) blocks** — a middleware that challenges the block's requests. All instances in a site share one Anubis server: a client that solved the challenge in one `handle` block passes every other block without a second challenge.
+- **Top level of a site block** — provisions the shared Anubis server and serves the static challenge assets under `/.within.website/`. Place it once per site, outside any `handle` block, before the blocks. Its `policy_file` also becomes the default policy that handle-block gates inherit. With the `protect` option it additionally challenges every non-static request and, on success, continues to the rest of the site, so one directive is enough to protect a whole site.
+- **Inside `handle` (or `route`) blocks** — a middleware gate. Each block gets its own Anubis server: its own challenge store, signing key and cookie names. Clearing one gate never auto-validates another and never overwrites another gate's clearance in the browser. A block without `policy_file` inherits the top-level directive's policy.
+
+The pass-challenge API lives under `/.within.website/`; requests to it are dispatched to the gate that issued the challenge, so gates stay independent even though they share the static route.
 
 The `anubis` middleware sets `X-Real-IP` from the peer address when the request has none; Anubis requires that header. When Caddy runs behind another proxy or TLS terminator, set `X-Real-IP` in that front proxy — Anubis trusts the header unconditionally.
 
@@ -46,21 +48,26 @@ The top-level directive alone can protect the entire site; the remaining directi
 }
 ```
 
-### Path-Scoped Protection Across Multiple Handle Blocks
+### Independent Gates in Multiple Handle Blocks
 
-Protect only specific paths while leaving others public. The two protected blocks share one Anubis server, so a client verifies once for both:
+Each `anubis` block is a separate gate. Clients verify per gate; the two gates below never see each other's clearances:
 
 ```caddy
 :8080 {
-    anubis               # Provisions the shared server + static assets
+    anubis {             # Static assets + default policy for the gates
+        protect off
+        policy_file /etc/anubis/site.yaml
+    }
 
     handle /admin/* {
-        anubis
+        anubis {         # Own store, key and cookies
+            policy_file /etc/anubis/admin.yaml
+        }
         respond "Admin area"
     }
 
     handle /api/* {
-        anubis
+        anubis           # Inherits /etc/anubis/site.yaml
         respond "API"
     }
 
@@ -80,16 +87,16 @@ anubis {
     # Redirect to a fixed URL instead of proxying to the next handler
     target https://example.com
 
-    # Path to a custom Anubis policy file
+    # Path to a custom Anubis policy file (also the site default policy)
     policy_file /etc/anubis/policy.yaml
 }
 ```
 
-Inside `handle` blocks `anubis` takes no options: policy and target belong to the top-level directive that provisions the shared server.
+Inside `handle` blocks `anubis` accepts `policy_file` and `target`. Both are per-gate: a gate with `target` redirects verified clients to its own URL, and a gate's `policy_file` selects only that gate's rules.
 
 ### Migrating from `init_anubis`
 
-`init_anubis` is now the top-level behavior of `anubis` — rename the directive. Handle-block `anubis` instances no longer accept `policy_file`/`target`; move them to the top-level directive.
+`init_anubis` is now the top-level behavior of `anubis` — rename the directive. Handle-block `anubis` instances are independent gates: each provisions its own server, and `policy_file`/`target` are per-gate options again.
 
 ## Automated updates
 

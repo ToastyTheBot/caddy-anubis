@@ -38,6 +38,11 @@ func (n *recordingNext) ServeHTTP(w http.ResponseWriter, r *http.Request) error 
 	return nil
 }
 
+// funcNext adapts a function to caddyhttp.Handler.
+type funcNext func(http.ResponseWriter, *http.Request) error
+
+func (f funcNext) ServeHTTP(w http.ResponseWriter, r *http.Request) error { return f(w, r) }
+
 func newContext(t *testing.T) caddy.Context {
 	t.Helper()
 	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
@@ -54,16 +59,22 @@ func provision(t *testing.T, m *caddyanubis.AnubisMiddleware) *caddyanubis.Anubi
 	return m
 }
 
-// newHandleBlock creates the handle-block flavor: challenges, non-authoritative.
+// newHandleBlock creates a handle-block gate: own server, own cookies.
 func newHandleBlock(t *testing.T, policyFile string) *caddyanubis.AnubisMiddleware {
+	t.Helper()
+	return newHandleBlockTarget(t, policyFile, nil)
+}
+
+func newHandleBlockTarget(t *testing.T, policyFile string, target *string) *caddyanubis.AnubisMiddleware {
 	t.Helper()
 	return provision(t, &caddyanubis.AnubisMiddleware{
 		PolicyFile: policyFile,
+		Target:     target,
 		Protect:    new(true),
 	})
 }
 
-// newTopLevel creates the top-level flavor: provisions the shared server.
+// newTopLevel creates the top-level flavor: provisions the site server.
 func newTopLevel(t *testing.T, protect bool, policyFile string, target *string) *caddyanubis.AnubisMiddleware {
 	t.Helper()
 	return provision(t, &caddyanubis.AnubisMiddleware{
@@ -171,7 +182,7 @@ func passChallenge(t *testing.T, srv caddyhttp.MiddlewareHandler, page string, c
 	return jar
 }
 
-func challengePage(t *testing.T, srv caddyhttp.MiddlewareHandler, path string) (*httptest.ResponseRecorder, *recordingNext) {
+func challengePage(t *testing.T, srv caddyhttp.MiddlewareHandler, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	next := &recordingNext{}
 	rec := httptest.NewRecorder()
@@ -185,31 +196,113 @@ func challengePage(t *testing.T, srv caddyhttp.MiddlewareHandler, path string) (
 		body := rec.Body.String()
 		t.Fatalf("want challenge page for %s, got %d %s", path, rec.Code, body[:min(300, len(body))])
 	}
-	return rec, next
+	return rec
 }
 
-// --- shared server across handle blocks ----------------------------------
-
-// The user-facing contract: one anubis per handle block, one solved
-// challenge verifies in every block.
-func TestSharedServerAcrossHandleBlocks(t *testing.T) {
-	a := newHandleBlock(t, "testdata/challenge.yaml")
-	b := newHandleBlock(t, "testdata/challenge.yaml")
-
-	rec, _ := challengePage(t, a, "/a")
-	jar := passChallenge(t, a, rec.Body.String(), cookiesFrom(rec))
-
-	// The same solved session passes the other block, and its pass-challenge
-	// may even be routed through the other block's middleware.
-	nextB := &recordingNext{}
-	recB := httptest.NewRecorder()
-	if err := b.ServeHTTP(recB, newRequest(http.MethodGet, "/b", jar), nextB); err != nil {
+func verifiedReaches(t *testing.T, srv caddyhttp.MiddlewareHandler, path string, jar map[string]string) {
+	t.Helper()
+	next := &recordingNext{}
+	rec := httptest.NewRecorder()
+	if err := srv.ServeHTTP(rec, newRequest(http.MethodGet, path, jar), next); err != nil {
 		t.Fatal(err)
 	}
-	if !nextB.Called {
-		t.Fatalf("session from block A must verify in block B, body=%s", recB.Body.String())
+	if !next.Called {
+		t.Fatalf("verified client must reach next at %s, body=%s", path, rec.Body.String())
 	}
 }
+
+// --- independent gates -----------------------------------------------------
+
+// The user-facing contract: each handle-block gate is separate. Clearing
+// one neither auto-validates another nor overwrites its clearance.
+func TestIndependentGates(t *testing.T) {
+	a := newHandleBlock(t, "testdata/challenge.yaml")
+	b := newHandleBlock(t, "testdata/challenge2.yaml")
+
+	// Clear gate A.
+	recA := challengePage(t, a, "/a")
+	jarA := passChallenge(t, a, recA.Body.String(), cookiesFrom(recA))
+	verifiedReaches(t, a, "/a", jarA)
+
+	// Gate cookie names are per-instance and disjoint between gates.
+	if !strings.Contains(firstKey(jarA), "__") {
+		t.Errorf("gate cookies must be renamed per instance, got %v", names(jarA))
+	}
+
+	// Gate B still challenges: A's clearance did not auto-validate B.
+	recB := challengePage(t, b, "/b")
+	jarB := passChallenge(t, b, recB.Body.String(), cookiesFrom(recB))
+	verifiedReaches(t, b, "/b", jarB)
+	for name := range jarB {
+		if _, ok := jarA[name]; ok {
+			t.Errorf("gates must not share cookie %q", name)
+		}
+	}
+
+	// A is still cleared after B was solved: B did not invalidate A.
+	verifiedReaches(t, a, "/a", jarA)
+	// And B still requires its own clearance: A's jar does not pass B.
+	next := &recordingNext{}
+	rec := httptest.NewRecorder()
+	if err := b.ServeHTTP(rec, newRequest(http.MethodGet, "/b", jarA), next); err != nil {
+		t.Fatal(err)
+	}
+	if next.Called {
+		t.Error("gate A's clearance must not validate gate B")
+	}
+}
+
+// pass-challenge reaches the gate that issued the challenge even when the
+// request arrives at another instance (the static route owns the API path).
+func TestAPIDispatchRoutesToIssuingGate(t *testing.T) {
+	issuer := newHandleBlock(t, "testdata/challenge.yaml")
+	other := newHandleBlock(t, "testdata/challenge2.yaml")
+
+	rec := challengePage(t, issuer, "/admin/")
+	jar := passChallenge(t, other, rec.Body.String(), cookiesFrom(rec)) // pass via the OTHER instance
+	verifiedReaches(t, issuer, "/admin/", jar)
+}
+
+// A chain of two gates: the first block's target short-circuits, so the
+// second gate is never consulted and its store stays untouched.
+func TestChainFirstTargetShortCircuits(t *testing.T) {
+	target := "https://example.com/after-first"
+	first := newHandleBlockTarget(t, "testdata/allow.yaml", &target)
+	second := newHandleBlock(t, "testdata/challenge.yaml")
+
+	secondNext := &recordingNext{}
+	chain := funcNext(func(w http.ResponseWriter, r *http.Request) error {
+		return second.ServeHTTP(w, r, secondNext)
+	})
+
+	rec := httptest.NewRecorder()
+	if err := first.ServeHTTP(rec, newRequest(http.MethodGet, "/", nil), chain); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != http.StatusTemporaryRedirect || rec.Header().Get("Location") != target {
+		t.Fatalf("want 307 to target, got %d %q", rec.Code, rec.Header().Get("Location"))
+	}
+	if secondNext.Called {
+		t.Error("second gate must not run when the first redirects")
+	}
+}
+
+func firstKey(m map[string]string) string {
+	for k := range m {
+		return k
+	}
+	return ""
+}
+
+func names(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// --- handle-block static serving --------------------------------------------
 
 func TestHandleBlockServesStaticAssets(t *testing.T) {
 	a := newHandleBlock(t, "testdata/challenge.yaml")
@@ -227,7 +320,7 @@ func TestHandleBlockServesStaticAssets(t *testing.T) {
 	}
 }
 
-// --- top-level flavors ----------------------------------------------------
+// --- top-level flavors ------------------------------------------------------
 
 func TestStaticInstancePassesNonStaticToNext(t *testing.T) {
 	m := newTopLevel(t, false, "testdata/challenge.yaml", nil)
@@ -266,7 +359,7 @@ func TestProtectInstanceServesRobots(t *testing.T) {
 	}
 }
 
-// --- challenge behaviors ---------------------------------------------------
+// --- challenge behaviors ------------------------------------------------------
 
 func TestRealIPSetAndPreserved(t *testing.T) {
 	m := newTopLevel(t, true, "testdata/allow.yaml", nil)
@@ -298,17 +391,9 @@ func TestRealIPSetAndPreserved(t *testing.T) {
 func TestChallengeSolvedReachesUpstream(t *testing.T) {
 	m := newTopLevel(t, true, "testdata/challenge.yaml", nil)
 
-	rec, _ := challengePage(t, m, "/")
+	rec := challengePage(t, m, "/")
 	jar := passChallenge(t, m, rec.Body.String(), cookiesFrom(rec))
-
-	next := &recordingNext{}
-	rec = httptest.NewRecorder()
-	if err := m.ServeHTTP(rec, newRequest(http.MethodGet, "/", jar), next); err != nil {
-		t.Fatal(err)
-	}
-	if !next.Called {
-		t.Fatalf("verified client must reach next, body=%s", rec.Body.String())
-	}
+	verifiedReaches(t, m, "/", jar)
 }
 
 func TestDenyBlocksUpstream(t *testing.T) {
@@ -344,10 +429,10 @@ func TestTargetRedirectsInsteadOfNext(t *testing.T) {
 	}
 }
 
-// --- global server lifecycle -----------------------------------------------
+// --- global server lifecycle --------------------------------------------------
 
 // A reload that drops the top-level instance must re-point the global at a
-// surviving handle-block server so static assets keep working.
+// surviving gate's server so static assets keep working.
 func TestCleanupRepointsGlobalToSurvivor(t *testing.T) {
 	top := newTopLevel(t, false, "testdata/allow.yaml", nil)
 	survivor := newHandleBlock(t, "testdata/allow.yaml")
