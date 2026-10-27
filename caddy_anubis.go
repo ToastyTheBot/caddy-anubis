@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"reflect"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -33,7 +34,14 @@ const staticPrefix = "/.within.website/"
 // statePolicyKey is the server-block State key under which the top-level
 // directive records its policy_file so handle-block instances inherit the
 // site policy when they set none of their own.
-const statePolicyKey = "caddyanubis.policy_file"
+const (
+	statePolicyKey = "caddyanubis.policy_file"
+	// stateGateCountKey counts handle-block gates per site so two gates
+	// with an identical policy_file and target still get distinct cookie
+	// names. Config order is fixed, so the counter is stable across
+	// reloads and clearances survive them.
+	stateGateCountKey = "caddyanubis.gate_count"
+)
 
 // anubisServer is the site server provisioned by the top-level directive.
 // Static assets are served from it; handle-block instances keep dedicated
@@ -107,12 +115,12 @@ func releaseGlobalServer(s *libanubis.Server) {
 // lib sees them, and Set-Cookie responses are renamed back.
 
 // gateCookieID derives a stable per-gate suffix from its configuration.
-func gateCookieID(policyFile string, target *string) string {
+func gateCookieID(policyFile string, target *string, instance int) string {
 	t := ""
 	if target != nil {
 		t = *target
 	}
-	sum := sha256.Sum256([]byte(policyFile + "|" + t))
+	sum := sha256.Sum256([]byte(policyFile + "|" + t + "|" + strconv.Itoa(instance)))
 	return hex.EncodeToString(sum[:4])
 }
 
@@ -396,6 +404,11 @@ type AnubisMiddleware struct {
 	// server and claim the global slot used for static assets.
 	Authoritative bool `json:"authoritative,omitempty"`
 
+	// Instance is the 1-based position of the gate within its site,
+	// assigned by the parser. It keeps cookie names distinct when two
+	// gates share a policy_file and target.
+	Instance int `json:"instance,omitempty"`
+
 	anubisPolicy *policy.ParsedConfig
 	server       *libanubis.Server
 	gate         *apiGate
@@ -450,7 +463,7 @@ func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 	m.cookieID = ""
 	if !m.Authoritative {
 		// Independent gate: dedicated store, key, and cookie names.
-		m.cookieID = gateCookieID(m.PolicyFile, m.Target)
+		m.cookieID = gateCookieID(m.PolicyFile, m.Target, m.Instance)
 	}
 	m.gate = &apiGate{server: m.server, cookieID: m.cookieID}
 	registerGate(m.gate)
@@ -607,6 +620,12 @@ func parseAnubis(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error) {
 			}
 		}
 		m.Protect = new(true)
+		if h.State != nil {
+			n, _ := h.State[stateGateCountKey].(int)
+			n++
+			h.State[stateGateCountKey] = n
+			m.Instance = n
+		}
 		return h.NewRoute(matcherSet, &m), nil
 	}
 

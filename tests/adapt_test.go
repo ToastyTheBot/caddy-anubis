@@ -23,6 +23,7 @@ type handlerJSON struct {
 	PolicyFile    string      `json:"policy_file"`
 	Target        *string     `json:"target"`
 	Authoritative bool        `json:"authoritative"`
+	Instance      int         `json:"instance"`
 	Routes        []routeJSON `json:"routes"`
 }
 
@@ -386,5 +387,69 @@ func TestAdaptTopLevelRequiresBlockForOptions(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "block") {
 		t.Fatalf("error must mention the block form, got: %v", err)
+	}
+}
+
+// Two gates with the same policy_file get distinct per-site instance
+// numbers, so their cookie-name suffixes cannot collide in a browser.
+func TestAdaptSamePolicyGatesGetDistinctIdentities(t *testing.T) {
+	routes := adapt(t, `:8080 {
+	handle /a {
+		anubis {
+			policy_file /tmp/same.yaml
+		}
+		respond "a"
+	}
+	handle /b {
+		anubis {
+			policy_file /tmp/same.yaml
+		}
+		respond "b"
+	}
+}`)
+	var instances []int
+	for _, r := range routes {
+		hs := handlersOf(r)
+		if len(hs) == 0 || hs[0].Handler != "anubis" {
+			continue
+		}
+		if hs[0].PolicyFile != "/tmp/same.yaml" {
+			t.Errorf("gate policy_file lost: %+v", hs[0])
+		}
+		instances = append(instances, hs[0].Instance)
+	}
+	if len(instances) != 2 {
+		t.Fatalf("want 2 gates, got %+v", instances)
+	}
+	if instances[0] == instances[1] {
+		t.Errorf("same-policy gates need distinct instance numbers, got %v", instances)
+	}
+}
+
+// Parsing is sequential: a handle block written above the top-level
+// directive cannot see its policy_file, so it keeps the built-in default.
+// This pins the documented "place the top-level directive first" rule.
+func TestAdaptBlockAboveTopLevelDoesNotInherit(t *testing.T) {
+	routes := adapt(t, `:8080 {
+	handle /a {
+		anubis
+		respond "a"
+	}
+	anubis {
+		policy_file /etc/anubis/site.yaml
+	}
+}`)
+	var block *handlerJSON
+	for i := range routes {
+		hs := handlersOf(routes[i])
+		if len(hs) > 0 && hs[0].Handler == "anubis" && !hs[0].Authoritative {
+			block = &hs[0]
+		}
+	}
+	if block == nil {
+		t.Fatal("handle-block gate not found")
+	}
+	if block.PolicyFile != "" {
+		t.Errorf("block above the top-level directive must keep the default policy, got %q", block.PolicyFile)
 	}
 }

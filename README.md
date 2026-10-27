@@ -15,7 +15,7 @@ xcaddy build --with github.com/ToastyTheBot/caddy-anubis
 One directive, `anubis`, used in two positions:
 
 - **Top level of a site block** — provisions the shared Anubis server and serves the static challenge assets under `/.within.website/`. Place it once per site, outside any `handle` block, before the blocks. Its `policy_file` also becomes the default policy that handle-block gates inherit. With the `protect` option it additionally challenges every non-static request and, on success, continues to the rest of the site, so one directive is enough to protect a whole site.
-- **Inside `handle` (or `route`) blocks** — a middleware gate. Each block gets its own Anubis server: its own challenge store, signing key and cookie names. Clearing one gate never auto-validates another and never overwrites another gate's clearance in the browser. A block without `policy_file` inherits the top-level directive's policy.
+- **Inside `handle` (or `route`) blocks** — a middleware gate. Each block gets its own Anubis server: its own challenge store, signing key and cookie names. Clearing one gate never auto-validates another and never overwrites another gate's clearance in the browser — cookie names are unique per gate position, so even two blocks with the same policy file stay independent. A block without `policy_file` inherits the top-level directive's policy.
 
 The pass-challenge API lives under `/.within.website/`; requests to it are dispatched to the gate that issued the challenge, so gates stay independent even though they share the static route.
 

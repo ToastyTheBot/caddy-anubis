@@ -67,10 +67,23 @@ func newHandleBlock(t *testing.T, policyFile string) *caddyanubis.AnubisMiddlewa
 
 func newHandleBlockTarget(t *testing.T, policyFile string, target *string) *caddyanubis.AnubisMiddleware {
 	t.Helper()
+	return newHandleBlockFull(t, policyFile, target, 1)
+}
+
+// newHandleBlockInstance creates a gate with an explicit per-site instance
+// number, as the parser assigns.
+func newHandleBlockInstance(t *testing.T, policyFile string, instance int) *caddyanubis.AnubisMiddleware {
+	t.Helper()
+	return newHandleBlockFull(t, policyFile, nil, instance)
+}
+
+func newHandleBlockFull(t *testing.T, policyFile string, target *string, instance int) *caddyanubis.AnubisMiddleware {
+	t.Helper()
 	return provision(t, &caddyanubis.AnubisMiddleware{
 		PolicyFile: policyFile,
 		Target:     target,
 		Protect:    new(true),
+		Instance:   instance,
 	})
 }
 
@@ -261,6 +274,39 @@ func TestAPIDispatchRoutesToIssuingGate(t *testing.T) {
 	rec := challengePage(t, issuer, "/admin/")
 	jar := passChallenge(t, other, rec.Body.String(), cookiesFrom(rec)) // pass via the OTHER instance
 	verifiedReaches(t, issuer, "/admin/", jar)
+}
+
+// Two gates with the same policy_file and no target keep separate
+// clearances: the parser assigns per-site instance numbers, so the cookie
+// names differ and neither clearance overwrites the other in a browser.
+func TestSamePolicyGatesStayIndependent(t *testing.T) {
+	a := newHandleBlockInstance(t, "testdata/challenge.yaml", 1)
+	b := newHandleBlockInstance(t, "testdata/challenge.yaml", 2)
+
+	recA := challengePage(t, a, "/a")
+	jarA := passChallenge(t, a, recA.Body.String(), cookiesFrom(recA))
+	verifiedReaches(t, a, "/a", jarA)
+
+	recB := challengePage(t, b, "/b")
+	jarB := passChallenge(t, b, recB.Body.String(), cookiesFrom(recB))
+	verifiedReaches(t, b, "/b", jarB)
+
+	for name := range jarB {
+		if _, ok := jarA[name]; ok {
+			t.Errorf("same-policy gates must not share cookie %q", name)
+		}
+	}
+	verifiedReaches(t, a, "/a", jarA)
+	verifiedReaches(t, b, "/b", jarB)
+
+	next := &recordingNext{}
+	rec := httptest.NewRecorder()
+	if err := b.ServeHTTP(rec, newRequest(http.MethodGet, "/b", jarA), next); err != nil {
+		t.Fatal(err)
+	}
+	if next.Called {
+		t.Error("gate A's clearance must not validate same-policy gate B")
+	}
 }
 
 // A chain of two gates: the first block's target short-circuits, so the
