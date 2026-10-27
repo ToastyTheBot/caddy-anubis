@@ -413,11 +413,22 @@ func parseAnubisStatic(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, err
 // assets at /.within.website/. This directive should be placed at the server
 // level (not inside a handle block) to ensure static assets are accessible
 // regardless of which paths the anubis directive protects.
+//
+// With the "protect" option it additionally challenges every non-static
+// request and, on success, continues to the next route, so a site can be
+// protected with this directive alone, without declaring anubis.
 type initAnubisMiddleware struct {
 	PolicyFile   string `json:"policy_file,omitempty"`
+	Protect      *bool  `json:"protect,omitempty"`
 	anubisPolicy *policy.ParsedConfig
 	anubisServer *libanubis.Server
 	logger       *zap.Logger
+}
+
+// protected reports whether this instance should also challenge
+// non-static requests and, on success, continue to the next route.
+func (m *initAnubisMiddleware) protected() bool {
+	return m.Protect != nil && *m.Protect
 }
 
 func (initAnubisMiddleware) CaddyModule() caddy.ModuleInfo {
@@ -439,6 +450,13 @@ func (m *initAnubisMiddleware) Provision(ctx caddy.Context) error {
 
 	m.anubisServer, err = libanubis.New(libanubis.Options{
 		Next: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next, ok := r.Context().Value(nextHandlerCtxKey{}).(caddyhttp.Handler)
+			if ok && next != nil {
+				if err := next.ServeHTTP(w, r); err != nil {
+					m.logger.Error("downstream handler error", zap.Error(err))
+				}
+				return
+			}
 			http.NotFound(w, r)
 		}),
 		Policy:           pol,
@@ -450,6 +468,7 @@ func (m *initAnubisMiddleware) Provision(ctx caddy.Context) error {
 	}
 
 	anubisServer.Store(m.anubisServer)
+	registerAPIServer(m.anubisServer)
 	m.logger.Info("init_anubis provisioned")
 	return nil
 }
@@ -461,6 +480,7 @@ func (initAnubisMiddleware) Validate() error { return nil }
 // global for the static handler to delegate to.
 func (m *initAnubisMiddleware) Cleanup() error {
 	if m.anubisServer != nil {
+		unregisterAPIServer(m.anubisServer)
 		releaseGlobalServer(m.anubisServer)
 	}
 	return nil
@@ -476,6 +496,12 @@ func (m *initAnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request,
 		m.anubisServer.ServeHTTP(w, r)
 		return nil
 	}
+	if m.protected() {
+		ensureRealIP(r)
+		ctx := context.WithValue(r.Context(), nextHandlerCtxKey{}, next)
+		m.anubisServer.ServeHTTP(w, r.WithContext(ctx))
+		return nil
+	}
 	return next.ServeHTTP(w, r)
 }
 
@@ -487,6 +513,14 @@ func (m *initAnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error 
 		case "policy_file":
 			if d.NextArg() {
 				m.PolicyFile = d.Val()
+			}
+		case "protect":
+			if d.NextArg() && d.Val() == "off" {
+				off := false
+				m.Protect = &off
+			} else {
+				on := true
+				m.Protect = &on
 			}
 		default:
 			return d.Errf("unrecognized option: %s", d.Val())
@@ -511,6 +545,14 @@ func parseInitAnubis(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 				return nil, d.ArgErr()
 			}
 			m.PolicyFile = d.Val()
+		case "protect":
+			if d.NextArg() && d.Val() == "off" {
+				off := false
+				m.Protect = &off
+			} else {
+				on := true
+				m.Protect = &on
+			}
 		default:
 			return nil, d.Errf("unrecognized option: %s", d.Val())
 		}
@@ -527,12 +569,27 @@ func parseInitAnubis(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error
 		"path": caddyconfig.JSON(caddyhttp.MatchPath{"/.within.website/*"}, nil),
 	}
 
+	if !m.protected() {
+		return []httpcaddyfile.ConfigValue{
+			{
+				Class: "route",
+				Value: caddyhttp.Route{
+					MatcherSetsRaw: []caddy.ModuleMap{matcherSet},
+					HandlersRaw:    []json.RawMessage{jsonObj},
+				},
+			},
+		}, nil
+	}
+
+	// Protected: one catch-all route. The same instance serves static
+	// assets, the API, and the challenge (ServeHTTP branches by path), so
+	// challenges live in the server that answers pass-challenge. Ordered
+	// before invoke, it wraps the handle blocks below it.
 	return []httpcaddyfile.ConfigValue{
 		{
 			Class: "route",
 			Value: caddyhttp.Route{
-				MatcherSetsRaw: []caddy.ModuleMap{matcherSet},
-				HandlersRaw:    []json.RawMessage{jsonObj},
+				HandlersRaw: []json.RawMessage{jsonObj},
 			},
 		},
 	}, nil

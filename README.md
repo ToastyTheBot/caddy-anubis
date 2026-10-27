@@ -14,7 +14,7 @@ xcaddy build --with github.com/ToastyTheBot/caddy-anubis
 
 Two directives are available:
 
-- **`init_anubis`** — server-level directive that provisions the Anubis server and serves static challenge assets at `/.within.website/`. Place once per server block, outside any `handle` blocks.
+- **`init_anubis`** — server-level directive that provisions the Anubis server and serves static challenge assets at `/.within.website/`. Place once per server block, outside any `handle` blocks. With its `protect` option it also challenges every non-static request and, on success, continues to the rest of the site, so one directive is enough to protect a whole server block.
 - **`anubis`** — handler-level middleware that protects specific paths. Use inside `handle` blocks to protect root or subdirectory paths.
 
 The `anubis` middleware sets `X-Real-IP` from the peer address when the request has none; Anubis requires that header. When Caddy runs behind another proxy or TLS terminator, set `X-Real-IP` in that front proxy — Anubis trusts the header unconditionally.
@@ -29,6 +29,20 @@ The `anubis` middleware sets `X-Real-IP` from the peer address when the request 
         anubis           # Protect all paths under this handler
         file_server
     }
+}
+```
+
+### Single-Directive Protection
+
+`init_anubis` alone can protect the entire site; the remaining directives run after the challenge passes:
+
+```caddy
+:8080 {
+    init_anubis {
+        protect
+    }
+
+    file_server
 }
 ```
 
@@ -57,6 +71,18 @@ Protect only specific paths while leaving others public:
 anubis {
     # Redirect to a fixed URL instead of proxying to the next handler
     target https://example.com
+
+    # Path to a custom Anubis policy file
+    policy_file /etc/anubis/policy.yaml
+}
+```
+
+### `init_anubis` Options
+
+```caddy
+init_anubis {
+    # Challenge all non-static requests (default: off, static assets only)
+    protect
 
     # Path to a custom Anubis policy file
     policy_file /etc/anubis/policy.yaml
