@@ -12,10 +12,10 @@ xcaddy build --with github.com/ToastyTheBot/caddy-anubis
 
 ## Usage
 
-Two directives are available:
+One directive, `anubis`, used in two positions:
 
-- **`init_anubis`** — server-level directive that provisions the Anubis server and serves static challenge assets at `/.within.website/`. Place once per server block, outside any `handle` blocks. With its `protect` option it also challenges every non-static request and, on success, continues to the rest of the site, so one directive is enough to protect a whole server block.
-- **`anubis`** — handler-level middleware that protects specific paths. Use inside `handle` blocks to protect root or subdirectory paths.
+- **Top level of a site block** — provisions the shared Anubis server and serves the static challenge assets under `/.within.website/`. Place it once per site, outside any `handle` block. With its `protect` option it also challenges every non-static request and, on success, continues to the rest of the site, so one directive is enough to protect a whole site.
+- **Inside `handle` (or `route`) blocks** — a middleware that challenges the block's requests. All instances in a site share one Anubis server: a client that solved the challenge in one `handle` block passes every other block without a second challenge.
 
 The `anubis` middleware sets `X-Real-IP` from the peer address when the request has none; Anubis requires that header. When Caddy runs behind another proxy or TLS terminator, set `X-Real-IP` in that front proxy — Anubis trusts the header unconditionally.
 
@@ -23,7 +23,7 @@ The `anubis` middleware sets `X-Real-IP` from the peer address when the request 
 
 ```caddy
 :8080 {
-    init_anubis          # Global: provisions server + serves static assets
+    anubis               # Global: provisions server + serves static assets
 
     handle {
         anubis           # Protect all paths under this handler
@@ -32,13 +32,13 @@ The `anubis` middleware sets `X-Real-IP` from the peer address when the request 
 }
 ```
 
-### Single-Directive Protection
+### Site-Wide Protection
 
-`init_anubis` alone can protect the entire site; the remaining directives run after the challenge passes:
+The top-level directive alone can protect the entire site; the remaining directives run after the challenge passes:
 
 ```caddy
 :8080 {
-    init_anubis {
+    anubis {
         protect
     }
 
@@ -46,17 +46,22 @@ The `anubis` middleware sets `X-Real-IP` from the peer address when the request 
 }
 ```
 
-### Path-Scoped Protection
+### Path-Scoped Protection Across Multiple Handle Blocks
 
-Protect only specific paths while leaving others public:
+Protect only specific paths while leaving others public. The two protected blocks share one Anubis server, so a client verifies once for both:
 
 ```caddy
 :8080 {
-    init_anubis
+    anubis               # Provisions the shared server + static assets
 
     handle /admin/* {
         anubis
         respond "Admin area"
+    }
+
+    handle /api/* {
+        anubis
+        respond "API"
     }
 
     handle {
@@ -65,10 +70,13 @@ Protect only specific paths while leaving others public:
 }
 ```
 
-### `anubis` Options
+### `anubis` Options (top level)
 
 ```caddy
 anubis {
+    # Challenge all non-static requests (default: off, static assets only)
+    protect
+
     # Redirect to a fixed URL instead of proxying to the next handler
     target https://example.com
 
@@ -77,17 +85,11 @@ anubis {
 }
 ```
 
-### `init_anubis` Options
+Inside `handle` blocks `anubis` takes no options: policy and target belong to the top-level directive that provisions the shared server.
 
-```caddy
-init_anubis {
-    # Challenge all non-static requests (default: off, static assets only)
-    protect
+### Migrating from `init_anubis`
 
-    # Path to a custom Anubis policy file
-    policy_file /etc/anubis/policy.yaml
-}
-```
+`init_anubis` is now the top-level behavior of `anubis` — rename the directive. Handle-block `anubis` instances no longer accept `policy_file`/`target`; move them to the top-level directive.
 
 ## Automated updates
 

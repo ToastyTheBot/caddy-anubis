@@ -1,0 +1,4 @@
+bots:
+  - name: test-deny
+    user_agent_regex: "denying-bot"
+    action: DENY

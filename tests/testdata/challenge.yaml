@@ -1,0 +1,7 @@
+bots:
+  - name: test-challenge
+    user_agent_regex: "\\w+"
+    action: CHALLENGE
+    challenge:
+      difficulty: 1
+      algorithm: fast

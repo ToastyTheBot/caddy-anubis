@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **Caddy HTTP server module** that integrates [Anubis](https://github.com/TecharoHQ/anubis) proof-of-work challenges to protect upstream resources from scraper bots and AI crawlers. It provides two Caddyfile directives:
+This is a **Caddy HTTP server module** that integrates [Anubis](https://github.com/TecharoHQ/anubis) proof-of-work challenges to protect upstream resources from scraper bots and AI crawlers. It provides one Caddyfile directive, `anubis`, usable in two positions:
 
-- **`init_anubis`** - Server-level directive that provisions the global Anubis server and serves static assets at `/.within.website/`. Place once per server block.
-- **`anubis`** - Handler-level middleware that can be used inside `handle` blocks to protect specific paths (root or subdirectory).
+- **Top level of a site block** - Provisions the shared Anubis server and serves static assets at `/.within.website/`. Place once per site. With `protect` it also challenges every non-static request.
+- **Inside `handle`/`route` blocks** - Middleware that challenges the block's requests. All instances share one Anubis server, so a solved challenge verifies in every block.
 
 ## Key Dependencies
 
@@ -16,19 +16,18 @@ This is a **Caddy HTTP server module** that integrates [Anubis](https://github.c
 
 ## Architecture
 
-The entire plugin is a single Go file: `caddy_anubis.go`. Three middleware types:
+The entire plugin is a single Go file: `caddy_anubis.go`. One module, `AnubisMiddleware` (`http.handlers.anubis`), backs the unified directive; `RegisterDirective("anubis", parseAnubis)` serves both positions and `inHandleBlock` (Helper `State` vs `BlockState` map identity, requires caddy >= v2.11.7, pinned by adapt tests) picks the flavor:
 
-- **`initAnubisMiddleware`** - Provisions the global Anubis server and serves `/.within.website/*` routes. Registered via `RegisterDirective` so it creates its own route with path matching, independent of `handle` blocks. With the `protect` option it instead emits a single catch-all route that challenges every non-static request and, on success, continues to the following routes (context passthrough like `AnubisMiddleware`, `http.NotFound` when there is no next), so `init_anubis` alone can protect a whole server block. Its server registers in the API delegation list, so `pass-challenge` reaches the instance that issued the challenge.
-- **`AnubisMiddleware`** - Creates its own Anubis server per-instance with the correct Caddy passthrough (via `context.WithValue`). Sets `X-Real-IP` from the peer address when absent (Anubis requires the header and trusts it unconditionally). Each instance keeps its own challenge store, so `/.within.website/` API requests (`pass-challenge` etc.) are delegated to the middleware server that issued the challenge (`serveAnubisAPI`); static assets stay on the global server. Optionally stores itself as the global server if `init_anubis` hasn't run. Supports `target <url>` and `policy_file <path>`.
+- **Top-level flavor** - `authoritative:true` instances provision the shared Anubis server (`Store`) with `policy_file`/`target`/`protect`, and emit routes: the static route (`/.within.website/*`, `protect:false`) plus, with `protect`, a catch-all or matcher-scoped challenge route (inline `/x` or named `@m` matcher tokens supported).
+- **Handle-block flavor** - `protect:true`, non-authoritative, no Caddyfile options (`policy_file`/`target` error and point at the top-level directive). Challenges the enclosing block; next handler is passed to Anubis via `context.WithValue(nextHandlerCtxKey)`.
+- **Shared server** - every instance serves through `anubisServer atomic.Pointer[libanubis.Server]`; handle-block instances `CompareAndSwap` in a default server when none exists, the top-level instance `Store`s the authoritative one. One challenge store and session key site-wide. `liveServers` lets cleanup re-point the global at a survivor. `ensureRealIP` sets `X-Real-IP` from the peer when absent (Anubis requires and trusts it).
 - **`anubisStaticMiddleware`** - Backward compatibility handler that delegates `/.within.website/` to the global Anubis server.
-
-The global Anubis server is shared via `sync/atomic.Pointer[libanubis.Server]`.
 
 ### Caddyfile Example
 
 ```caddy
 :8080 {
-    init_anubis          # Global: provisions server + serves static assets
+    anubis               # Global: provisions server + serves static assets
 
     handle /admin/* {
         anubis           # Path-scoped: protects /admin/ only
@@ -90,7 +89,7 @@ For local fork development, a manual build is still available:
 ./caddy run --config Caddyfile
 ```
 
-The local Caddyfile serves on `:8080` with `init_anubis` + `anubis` in a `handle` block, falling back to `web/` file server.
+The local Caddyfile serves on `:8080` with top-level `anubis` plus `anubis` in a `handle` block, falling back to `web/` file server.
 
 ## Git Identity
 
@@ -106,4 +105,4 @@ git -c user.name="Claude Mythos" -c user.email=noreply@anthropic.com commit -m "
 
 The Anubis fork has its own **upstream-sync.yml** workflow that fetches upstream release tags, builds frontend assets, and pushes tagged commits to the fork.
 
-There are no tests in this repository. `go vet ./...` is the only static check.
+Tests live in `tests/` (`go test ./tests/`): `adapt_test.go` covers the Caddyfile adapter for both directive positions; `serve_test.go` covers ServeHTTP behavior (challenge/pass/deny/target/static/shared server) against `testdata/*.yaml` policies. `go vet ./...` is the static check.

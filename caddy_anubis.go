@@ -1,13 +1,11 @@
 package caddyanubis
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"io"
 	"net"
 	"net/http"
+	"reflect"
 	"runtime/debug"
 	"strings"
 	"sync/atomic"
@@ -23,38 +21,40 @@ import (
 	"go.uber.org/zap"
 )
 
-// anubisServer holds the most recently provisioned Anubis server.
-// The static middleware reads this to serve /.within.website/ assets.
+// staticPrefix is where Anubis serves its challenge assets and API, under
+// the /.within.website/ namespace.
+const staticPrefix = "/.within.website/"
+
+// anubisServer is the single shared Anubis server for the process. Every
+// anubis instance (top-level or inside a handle block) serves through it,
+// so one solved challenge verifies everywhere.
 var anubisServer atomic.Pointer[libanubis.Server]
 
-// nextHandlerCtxKey is used to pass the Caddy next handler through the
-// request context, avoiding shared mutable state on the middleware struct.
+// liveServers lists the servers of currently provisioned instances so a
+// cleanup can re-point the global pointer at a surviving server instead of
+// stranding requests on an unprovisioned one.
+var liveServers atomic.Pointer[[]*libanubis.Server]
+
+// nextHandlerCtxKey passes the Caddy next handler through the request
+// context, avoiding shared mutable state on the middleware struct.
 type nextHandlerCtxKey struct{}
 
-// anubisAPIServers lists the Anubis servers provisioned by anubis
-// middleware instances. Each instance keeps its own in-memory challenge
-// store, so a challenge issued by one server can only be verified by that
-// same server. The init_anubis route owns /.within.website/* (including the
-// pass-challenge API), so API requests are delegated to the middleware
-// servers instead of being answered by the global server.
-var anubisAPIServers atomic.Pointer[[]*libanubis.Server]
-
-func registerAPIServer(s *libanubis.Server) {
+func registerLiveServer(s *libanubis.Server) {
 	for {
-		old := anubisAPIServers.Load()
+		old := liveServers.Load()
 		next := []*libanubis.Server{s}
 		if old != nil {
 			next = append(next, *old...)
 		}
-		if anubisAPIServers.CompareAndSwap(old, &next) {
+		if liveServers.CompareAndSwap(old, &next) {
 			return
 		}
 	}
 }
 
-func unregisterAPIServer(s *libanubis.Server) {
+func unregisterLiveServer(s *libanubis.Server) {
 	for {
-		old := anubisAPIServers.Load()
+		old := liveServers.Load()
 		if old == nil {
 			return
 		}
@@ -64,129 +64,25 @@ func unregisterAPIServer(s *libanubis.Server) {
 				next = append(next, x)
 			}
 		}
-		if anubisAPIServers.CompareAndSwap(old, &next) {
+		if liveServers.CompareAndSwap(old, &next) {
 			return
 		}
 	}
 }
 
-// releaseGlobalServer clears the global server pointer when it still points
-// at s and re-points it at any remaining registered middleware server, so a
-// reload that drops init_anubis does not strand the static handler on an
-// unprovisioned server.
+// releaseGlobalServer clears the global pointer when it still points at s
+// and re-points it at any surviving provisioned server.
 func releaseGlobalServer(s *libanubis.Server) {
 	if !anubisServer.CompareAndSwap(s, nil) {
 		return
 	}
-	if p := anubisAPIServers.Load(); p != nil {
+	if p := liveServers.Load(); p != nil {
 		for _, other := range *p {
-			if other != nil && anubisServer.CompareAndSwap(nil, other) {
+			if other != nil && other != s && anubisServer.CompareAndSwap(nil, other) {
 				return
 			}
 		}
 	}
-}
-
-// bufferedResponseWriter captures a response so a challenge-store miss can
-// be detected before anything is sent to the client.
-type bufferedResponseWriter struct {
-	header http.Header
-	status int
-	body   bytes.Buffer
-}
-
-func (b *bufferedResponseWriter) Header() http.Header {
-	if b.header == nil {
-		b.header = http.Header{}
-	}
-	return b.header
-}
-
-func (b *bufferedResponseWriter) Write(p []byte) (int, error) { return b.body.Write(p) }
-
-func (b *bufferedResponseWriter) WriteHeader(code int) { b.status = code }
-
-// miss reports whether this server failed to answer because it did not hold
-// the challenge: either the explicit "getChallenge failed" store error, or
-// any 500 while the client lacks the verification cookie (the server that
-// holds the challenge retries with a fresh challenge instead of erroring,
-// so a 500 from a server without the challenge must not be copied).
-func (b *bufferedResponseWriter) miss(noTestCookie bool) bool {
-	if b.status != http.StatusInternalServerError {
-		return false
-	}
-	return noTestCookie || bytes.Contains(b.body.Bytes(), []byte("getChallenge failed"))
-}
-
-func (b *bufferedResponseWriter) copyTo(w http.ResponseWriter) {
-	dst := w.Header()
-	for k, vs := range b.header {
-		for _, v := range vs {
-			dst.Add(k, v)
-		}
-	}
-	if b.status != 0 {
-		w.WriteHeader(b.status)
-	}
-	_, _ = w.Write(b.body.Bytes())
-}
-
-// serveAnubisAPI answers an Anubis API request with the first server whose
-// challenge store holds the challenge. preferred is tried first; the
-// remaining registered middleware servers are tried as fallbacks.
-func serveAnubisAPI(w http.ResponseWriter, r *http.Request, preferred *libanubis.Server) bool {
-	servers := make([]*libanubis.Server, 0, 2)
-	if preferred != nil {
-		servers = append(servers, preferred)
-	}
-	if p := anubisAPIServers.Load(); p != nil {
-		for _, s := range *p {
-			if s != nil && s != preferred {
-				servers = append(servers, s)
-			}
-		}
-	}
-	if len(servers) == 0 {
-		return false
-	}
-
-	var body []byte
-	if r.Body != nil && r.Body != http.NoBody {
-		body, _ = io.ReadAll(r.Body)
-		r.Body.Close()
-	}
-
-	// Without the verification cookie the lib consults its own store before
-	// deciding between the cookies-disabled error and a retry redirect, so a
-	// 500 from a server that lacks the challenge is indistinguishable from
-	// the real error; treat it as a miss and let the holder answer.
-	_, cookieErr := r.Cookie(anubis.TestCookieName)
-	noTestCookie := errors.Is(cookieErr, http.ErrNoCookie)
-
-	var first *bufferedResponseWriter
-	for _, s := range servers {
-		rr := r.Clone(r.Context())
-		if body != nil {
-			rr.Body = io.NopCloser(bytes.NewReader(body))
-			rr.ContentLength = int64(len(body))
-		} else {
-			rr.Body = http.NoBody
-			rr.ContentLength = 0
-		}
-		buf := &bufferedResponseWriter{}
-		s.ServeHTTP(buf, rr)
-		if !buf.miss(noTestCookie) {
-			buf.copyTo(w)
-			return true
-		}
-		if first == nil {
-			first = buf
-		}
-	}
-	if first != nil {
-		first.copyTo(w)
-	}
-	return true
 }
 
 // stampVersion replaces Anubis' "devel" version string with the module
@@ -225,22 +121,35 @@ func init() {
 	stampVersion()
 	caddy.RegisterModule(AnubisMiddleware{})
 	caddy.RegisterModule(anubisStaticMiddleware{})
-	caddy.RegisterModule(initAnubisMiddleware{})
 	httpcaddyfile.RegisterHandlerDirective("anubisStatic", parseAnubisStatic)
-	httpcaddyfile.RegisterHandlerDirective("anubis", parseAnubis)
+	httpcaddyfile.RegisterDirective("anubis", parseAnubis)
 	httpcaddyfile.RegisterDirectiveOrder("anubis", httpcaddyfile.After, "invoke")
-	httpcaddyfile.RegisterDirective("init_anubis", parseInitAnubis)
-	httpcaddyfile.RegisterDirectiveOrder("init_anubis", httpcaddyfile.Before, "invoke")
 }
 
-// AnubisMiddleware is a Caddy middleware that integrates Anubis proof-of-work
-// challenges to protect upstream resources from scraper bots and AI crawlers.
+// AnubisMiddleware is the single module behind the anubis directive.
+//
+// At the top level of a site block it provisions the shared Anubis server
+// and emits the static-asset route (and, with protect, the challenge
+// route). Inside a handle or route block it is a middleware that challenges
+// the block's requests. All instances share one Anubis server, so a client
+// verified in one handle block passes every other block without a second
+// challenge.
 type AnubisMiddleware struct {
-	Target     *string `json:"target,omitempty"`
-	PolicyFile string  `json:"policy_file,omitempty"`
+	// Target redirects verified requests to a fixed URL instead of
+	// continuing to the next handler. Top-level only.
+	Target *string `json:"target,omitempty"`
+	// PolicyFile is the path to a custom Anubis policy file. Top-level only.
+	PolicyFile string `json:"policy_file,omitempty"`
+	// Protect challenges non-static requests. Set by the parser: true for
+	// handle-block usage and the top-level protect route, false for the
+	// static route. Unset means challenge (hand-written JSON default).
+	Protect *bool `json:"protect,omitempty"`
+	// Authoritative marks the top-level instance whose provisioning creates
+	// the shared server with PolicyFile/Target and claims the global slot.
+	Authoritative bool `json:"authoritative,omitempty"`
 
 	anubisPolicy *policy.ParsedConfig
-	anubisServer *libanubis.Server
+	server       *libanubis.Server
 	logger       *zap.Logger
 }
 
@@ -251,17 +160,22 @@ func (AnubisMiddleware) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
+// challenges reports whether this instance challenges non-static requests.
+func (m *AnubisMiddleware) challenges() bool {
+	return m.Protect == nil || *m.Protect
+}
+
 func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger().Named("anubis")
 
-	// subrequestMode matches upstream: true when no target redirects.
+	// subrequestMode matches upstream: true unless a target redirects.
 	pol, err := libanubis.LoadPoliciesOrDefault(ctx, m.PolicyFile, anubis.DefaultDifficulty, "info", m.Target == nil)
 	if err != nil {
 		return err
 	}
 	m.anubisPolicy = pol
 
-	m.anubisServer, err = libanubis.New(libanubis.Options{
+	m.server, err = libanubis.New(libanubis.Options{
 		Next: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if m.Target != nil {
 				http.Redirect(w, r, *m.Target, http.StatusTemporaryRedirect)
@@ -272,7 +186,9 @@ func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 				if err := next.ServeHTTP(w, r); err != nil {
 					m.logger.Error("downstream handler error", zap.Error(err))
 				}
+				return
 			}
+			http.NotFound(w, r)
 		}),
 		Policy:           m.anubisPolicy,
 		ServeRobotsTXT:   true,
@@ -282,25 +198,31 @@ func (m *AnubisMiddleware) Provision(ctx caddy.Context) error {
 		return err
 	}
 
-	// If init_anubis has not provisioned a global server yet, store ours
-	// so that static asset routes can delegate to it.
-	anubisServer.CompareAndSwap(nil, m.anubisServer)
-	registerAPIServer(m.anubisServer)
-	m.logger.Info("anubis middleware provisioned")
+	if m.Authoritative {
+		// The top-level instance owns the shared server configuration
+		// (policy_file, target) and claims the global slot.
+		anubisServer.Store(m.server)
+	} else {
+		// Handle-block instances join an existing shared server or seed a
+		// default one until the top-level instance provisions its own.
+		anubisServer.CompareAndSwap(nil, m.server)
+	}
+	registerLiveServer(m.server)
+	m.logger.Info("anubis provisioned", zap.Bool("authoritative", m.Authoritative))
 	return nil
 }
 
 func (m *AnubisMiddleware) Validate() error { return nil }
 
-// Cleanup removes this instance's server from the API delegation registry
-// and releases the global pointer when it still points at this server, so
-// reloaded configs neither accumulate stale servers nor strand static assets.
+// Cleanup releases the global pointer when it still points at this
+// instance's server and re-points it at a surviving server, so reloads
+// neither strand static assets nor leave a dangling unprovisioned server.
 func (m *AnubisMiddleware) Cleanup() error {
-	if m.anubisServer == nil {
+	if m.server == nil {
 		return nil
 	}
-	unregisterAPIServer(m.anubisServer)
-	releaseGlobalServer(m.anubisServer)
+	unregisterLiveServer(m.server)
+	releaseGlobalServer(m.server)
 	return nil
 }
 
@@ -326,51 +248,170 @@ func ensureRealIP(r *http.Request) {
 }
 
 func (m *AnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	ensureRealIP(r)
-	if strings.HasPrefix(r.URL.Path, anubis.APIPrefix) {
-		r.RequestURI = r.URL.RequestURI()
-		if serveAnubisAPI(w, r, m.anubisServer) {
-			return nil
-		}
+	srv := anubisServer.Load()
+	if srv == nil {
+		srv = m.server
 	}
+	if srv == nil {
+		return next.ServeHTTP(w, r)
+	}
+	if strings.HasPrefix(r.URL.Path, staticPrefix) {
+		// Challenge assets, the pass-challenge API, and the honeypot live
+		// under the shared server; the instance that receives them does not
+		// matter because every instance shares one challenge store.
+		ensureRealIP(r)
+		r.RequestURI = r.URL.RequestURI()
+		srv.ServeHTTP(w, r)
+		return nil
+	}
+	if !m.challenges() {
+		return next.ServeHTTP(w, r)
+	}
+	ensureRealIP(r)
 	ctx := context.WithValue(r.Context(), nextHandlerCtxKey{}, next)
-	m.anubisServer.ServeHTTP(w, r.WithContext(ctx))
+	srv.ServeHTTP(w, r.WithContext(ctx))
 	return nil
 }
 
+// UnmarshalCaddyfile parses the handle-block flavor: anubis takes no
+// options there; site-wide configuration belongs to the top-level directive
+// that provisions the shared server.
 func (m *AnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume directive name
 
+	if d.NextArg() {
+		return d.Errf("unexpected argument %q; configure policy_file and target on the top-level anubis directive", d.Val())
+	}
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
 		switch d.Val() {
-		case "target":
-			if d.NextArg() {
-				val := d.Val()
-				m.Target = &val
-			}
-		case "policy_file":
-			if d.NextArg() {
-				m.PolicyFile = d.Val()
-			}
+		case "target", "policy_file":
+			return d.Errf("%s is only supported on the top-level anubis directive", d.Val())
 		default:
 			return d.Errf("unrecognized option: %s", d.Val())
 		}
 	}
-
 	return nil
 }
 
-func parseAnubis(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
-	var m AnubisMiddleware
-	if err := m.UnmarshalCaddyfile(h.Dispenser); err != nil {
+// inHandleBlock reports whether the directive is being parsed inside a
+// handle or route block rather than at the top level of a server block.
+// Caddy evaluates server-block segments with BlockState aliasing the shared
+// State map, and copies BlockState for each nested block (see
+// httpcaddyfile parseSubroute), so map identity distinguishes the two
+// positions. Pinned by TestAdaptHandleBlockUsesMiddlewareFlavor.
+func inHandleBlock(h httpcaddyfile.Helper) bool {
+	if h.State == nil || h.BlockState == nil {
+		return h.Nesting() > 0
+	}
+	return reflect.ValueOf(h.State).Pointer() != reflect.ValueOf(h.BlockState).Pointer()
+}
+
+// parseAnubis implements the unified anubis directive for both positions.
+func parseAnubis(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error) {
+	if !h.Next() {
+		return nil, h.ArgErr()
+	}
+
+	inBlock := inHandleBlock(h)
+
+	matcherSet, err := h.ExtractMatcherSet()
+	if err != nil {
 		return nil, err
 	}
-	return &m, nil
+
+	if inBlock {
+		// Middleware flavor: challenge the enclosing block's requests.
+		var m AnubisMiddleware
+		if err := m.UnmarshalCaddyfile(h.Dispenser); err != nil {
+			return nil, err
+		}
+		m.Protect = new(true)
+		return h.NewRoute(matcherSet, &m), nil
+	}
+
+	// Top-level flavor: provision the shared server and emit routes.
+	d := h.Dispenser
+	d.Next() // ExtractMatcherSet resets the dispenser; skip the directive name again
+	var m AnubisMiddleware
+	protected := false
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "policy_file":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			m.PolicyFile = d.Val()
+		case "target":
+			if !d.NextArg() {
+				return nil, d.ArgErr()
+			}
+			m.Target = new(d.Val())
+		case "protect":
+			if d.NextArg() && d.Val() == "off" {
+				m.Protect = new(false)
+				protected = false
+			} else {
+				m.Protect = new(true)
+				protected = true
+			}
+		default:
+			return nil, d.Errf("unrecognized option: %s", d.Val())
+		}
+	}
+	m.Authoritative = true
+
+	staticVal := caddyconfig.JSONModuleObject(AnubisMiddleware{
+		PolicyFile:    m.PolicyFile,
+		Protect:       new(false),
+		Authoritative: true,
+	}, "handler", "anubis", nil)
+	staticRoute := httpcaddyfile.ConfigValue{
+		Class: "route",
+		Value: caddyhttp.Route{
+			MatcherSetsRaw: []caddy.ModuleMap{
+				{"path": caddyconfig.JSON(caddyhttp.MatchPath{staticPrefix + "*"}, nil)},
+			},
+			HandlersRaw: []json.RawMessage{staticVal},
+		},
+	}
+
+	if !protected {
+		// Static assets and provisioning only; protection comes from
+		// handle-block instances.
+		return []httpcaddyfile.ConfigValue{staticRoute}, nil
+	}
+
+	protectVal := caddyconfig.JSONModuleObject(m, "handler", "anubis", nil)
+	if matcherSet == nil {
+		// Protected site-wide: one catch-all route serves static assets,
+		// the API, and the challenge (ServeHTTP branches by path).
+		return []httpcaddyfile.ConfigValue{
+			{
+				Class: "route",
+				Value: caddyhttp.Route{
+					HandlersRaw: []json.RawMessage{protectVal},
+				},
+			},
+		}, nil
+	}
+
+	// Matcher-scoped protection: the static route stays global so challenge
+	// assets and the API remain reachable.
+	return []httpcaddyfile.ConfigValue{
+		staticRoute,
+		{
+			Class: "route",
+			Value: caddyhttp.Route{
+				MatcherSetsRaw: []caddy.ModuleMap{matcherSet},
+				HandlersRaw:    []json.RawMessage{protectVal},
+			},
+		},
+	}, nil
 }
 
 // anubisStaticMiddleware serves Anubis static assets (/.within.website/) by
-// delegating to the Anubis server provisioned by the anubis directive.
-// Used for backward compatibility when init_anubis is not present.
+// delegating to the shared server. Kept for backward compatibility with
+// configs that reference http.handlers.anubis_static directly.
 type anubisStaticMiddleware struct{}
 
 func (anubisStaticMiddleware) CaddyModule() caddy.ModuleInfo {
@@ -385,13 +426,10 @@ func (anubisStaticMiddleware) Validate() error               { return nil }
 
 func (m anubisStaticMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	srv := anubisServer.Load()
-	if srv == nil || !strings.HasPrefix(r.URL.Path, "/.within.website/") {
+	if srv == nil || !strings.HasPrefix(r.URL.Path, staticPrefix) {
 		return next.ServeHTTP(w, r)
 	}
 	r.RequestURI = r.URL.RequestURI()
-	if strings.HasPrefix(r.URL.Path, anubis.APIPrefix) && serveAnubisAPI(w, r, srv) {
-		return nil
-	}
 	srv.ServeHTTP(w, r)
 	return nil
 }
@@ -409,192 +447,6 @@ func parseAnubisStatic(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, err
 	return m, nil
 }
 
-// initAnubisMiddleware provisions the global Anubis server and serves static
-// assets at /.within.website/. This directive should be placed at the server
-// level (not inside a handle block) to ensure static assets are accessible
-// regardless of which paths the anubis directive protects.
-//
-// With the "protect" option it additionally challenges every non-static
-// request and, on success, continues to the next route, so a site can be
-// protected with this directive alone, without declaring anubis.
-type initAnubisMiddleware struct {
-	PolicyFile   string `json:"policy_file,omitempty"`
-	Protect      *bool  `json:"protect,omitempty"`
-	anubisPolicy *policy.ParsedConfig
-	anubisServer *libanubis.Server
-	logger       *zap.Logger
-}
-
-// protected reports whether this instance should also challenge
-// non-static requests and, on success, continue to the next route.
-func (m *initAnubisMiddleware) protected() bool {
-	return m.Protect != nil && *m.Protect
-}
-
-func (initAnubisMiddleware) CaddyModule() caddy.ModuleInfo {
-	return caddy.ModuleInfo{
-		ID:  "http.handlers.init_anubis",
-		New: func() caddy.Module { return new(initAnubisMiddleware) },
-	}
-}
-
-func (m *initAnubisMiddleware) Provision(ctx caddy.Context) error {
-	m.logger = ctx.Logger().Named("init_anubis")
-
-	// init_anubis has no target, so subrequestMode is always true.
-	pol, err := libanubis.LoadPoliciesOrDefault(ctx, m.PolicyFile, anubis.DefaultDifficulty, "info", true)
-	if err != nil {
-		return err
-	}
-	m.anubisPolicy = pol
-
-	m.anubisServer, err = libanubis.New(libanubis.Options{
-		Next: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			next, ok := r.Context().Value(nextHandlerCtxKey{}).(caddyhttp.Handler)
-			if ok && next != nil {
-				if err := next.ServeHTTP(w, r); err != nil {
-					m.logger.Error("downstream handler error", zap.Error(err))
-				}
-				return
-			}
-			http.NotFound(w, r)
-		}),
-		Policy:           pol,
-		ServeRobotsTXT:   true,
-		CookieExpiration: anubis.CookieDefaultExpirationTime,
-	})
-	if err != nil {
-		return err
-	}
-
-	anubisServer.Store(m.anubisServer)
-	registerAPIServer(m.anubisServer)
-	m.logger.Info("init_anubis provisioned")
-	return nil
-}
-
-func (initAnubisMiddleware) Validate() error { return nil }
-
-// Cleanup releases the global server pointer when it still points at this
-// instance's server, so a reload that drops init_anubis leaves no dangling
-// global for the static handler to delegate to.
-func (m *initAnubisMiddleware) Cleanup() error {
-	if m.anubisServer != nil {
-		unregisterAPIServer(m.anubisServer)
-		releaseGlobalServer(m.anubisServer)
-	}
-	return nil
-}
-
-func (m *initAnubisMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if strings.HasPrefix(r.URL.Path, "/.within.website/") {
-		ensureRealIP(r)
-		r.RequestURI = r.URL.RequestURI()
-		if strings.HasPrefix(r.URL.Path, anubis.APIPrefix) && serveAnubisAPI(w, r, m.anubisServer) {
-			return nil
-		}
-		m.anubisServer.ServeHTTP(w, r)
-		return nil
-	}
-	if m.protected() {
-		ensureRealIP(r)
-		ctx := context.WithValue(r.Context(), nextHandlerCtxKey{}, next)
-		m.anubisServer.ServeHTTP(w, r.WithContext(ctx))
-		return nil
-	}
-	return next.ServeHTTP(w, r)
-}
-
-func (m *initAnubisMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	d.Next() // consume directive name
-
-	for nesting := d.Nesting(); d.NextBlock(nesting); {
-		switch d.Val() {
-		case "policy_file":
-			if d.NextArg() {
-				m.PolicyFile = d.Val()
-			}
-		case "protect":
-			if d.NextArg() && d.Val() == "off" {
-				off := false
-				m.Protect = &off
-			} else {
-				on := true
-				m.Protect = &on
-			}
-		default:
-			return d.Errf("unrecognized option: %s", d.Val())
-		}
-	}
-
-	return nil
-}
-
-func parseInitAnubis(h httpcaddyfile.Helper) ([]httpcaddyfile.ConfigValue, error) {
-	if !h.Next() {
-		return nil, h.ArgErr()
-	}
-
-	d := h.Dispenser
-	var m initAnubisMiddleware
-
-	for d.NextBlock(0) {
-		switch d.Val() {
-		case "policy_file":
-			if !d.NextArg() {
-				return nil, d.ArgErr()
-			}
-			m.PolicyFile = d.Val()
-		case "protect":
-			if d.NextArg() && d.Val() == "off" {
-				off := false
-				m.Protect = &off
-			} else {
-				on := true
-				m.Protect = &on
-			}
-		default:
-			return nil, d.Errf("unrecognized option: %s", d.Val())
-		}
-	}
-
-	mod, err := caddy.GetModule("http.handlers.init_anubis")
-	if err != nil {
-		return nil, err
-	}
-	var warnings []caddyconfig.Warning
-	jsonObj := caddyconfig.JSONModuleObject(m, "handler", mod.ID.Name(), &warnings)
-
-	matcherSet := caddy.ModuleMap{
-		"path": caddyconfig.JSON(caddyhttp.MatchPath{"/.within.website/*"}, nil),
-	}
-
-	if !m.protected() {
-		return []httpcaddyfile.ConfigValue{
-			{
-				Class: "route",
-				Value: caddyhttp.Route{
-					MatcherSetsRaw: []caddy.ModuleMap{matcherSet},
-					HandlersRaw:    []json.RawMessage{jsonObj},
-				},
-			},
-		}, nil
-	}
-
-	// Protected: one catch-all route. The same instance serves static
-	// assets, the API, and the challenge (ServeHTTP branches by path), so
-	// challenges live in the server that answers pass-challenge. Ordered
-	// before invoke, it wraps the handle blocks below it.
-	return []httpcaddyfile.ConfigValue{
-		{
-			Class: "route",
-			Value: caddyhttp.Route{
-				HandlersRaw: []json.RawMessage{jsonObj},
-			},
-		},
-	}, nil
-}
-
 // Interface guards
 var (
 	_ caddy.Provisioner           = (*AnubisMiddleware)(nil)
@@ -602,9 +454,4 @@ var (
 	_ caddyhttp.MiddlewareHandler = (*AnubisMiddleware)(nil)
 	_ caddyfile.Unmarshaler       = (*AnubisMiddleware)(nil)
 	_ caddy.CleanerUpper          = (*AnubisMiddleware)(nil)
-	_ caddy.Provisioner           = (*initAnubisMiddleware)(nil)
-	_ caddy.Validator             = (*initAnubisMiddleware)(nil)
-	_ caddyhttp.MiddlewareHandler = (*initAnubisMiddleware)(nil)
-	_ caddyfile.Unmarshaler       = (*initAnubisMiddleware)(nil)
-	_ caddy.CleanerUpper          = (*initAnubisMiddleware)(nil)
 )
