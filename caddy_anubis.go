@@ -115,6 +115,9 @@ func releaseGlobalServer(s *libanubis.Server) {
 // lib sees them, and Set-Cookie responses are renamed back.
 
 // gateCookieID derives a stable per-gate suffix from its configuration.
+// The instance number comes from config order, so it is stable across
+// reloads; adding or reordering handle blocks shifts it for the gates
+// below, whose clients must re-solve the challenge after such a reload.
 func gateCookieID(policyFile string, target *string, instance int) string {
 	t := ""
 	if target != nil {

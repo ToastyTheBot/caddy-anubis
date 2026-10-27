@@ -77,14 +77,17 @@ Each `anubis` block is a separate gate. Clients verify per gate; the two gates b
 }
 ```
 
-### `anubis` Options (top level)
+### `anubis` Arguments
+
+Top level of a site block:
 
 ```caddy
-anubis {
-    # Challenge all non-static requests (default: off, static assets only)
-    protect
+anubis [<matcher>] {
+    # Challenge all non-static requests (default: off)
+    protect          # or: protect off
 
-    # Redirect to a fixed URL instead of proxying to the next handler
+    # Redirect verified requests to a fixed URL instead of continuing
+    # to the rest of the site
     target https://example.com
 
     # Path to a custom Anubis policy file (also the site default policy)
@@ -92,7 +95,33 @@ anubis {
 }
 ```
 
-Inside `handle` blocks `anubis` accepts `policy_file` and `target`. Both are per-gate: a gate with `target` redirects verified clients to its own URL, and a gate's `policy_file` selects only that gate's rules.
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `<matcher>` | none | Optional path or named (`@tag`) matcher. With `protect` it scopes the challenge route to matching requests; the static-asset route stays global. Ignored without `protect`. |
+| `protect` | off | Bare `protect` adds the site-wide challenge route; `protect off` is the explicit default (static assets + site policy only). |
+| `target` | unset | Verified requests answer `307` to this URL instead of continuing to the next handler. |
+| `policy_file` | built-in Anubis policy | Policy YAML path. Also recorded as the site default that handle-block gates inherit. |
+
+Options must be inside a block: `anubis policy_file /x` fails adaptation.
+
+Inside `handle`/`route` blocks — per-gate options:
+
+```caddy
+anubis [<matcher>] {
+    policy_file /etc/anubis/admin.yaml
+    target https://example.com/done
+}
+```
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `<matcher>` | none | Optional path or named (`@tag`) matcher; scopes the gate within the enclosing block. |
+| `policy_file` | top-level directive's `policy_file`, else built-in | This gate's policy YAML. The top-level directive must appear before the block for inheritance to apply. |
+| `target` | unset | This gate redirects verified requests to the URL; other gates are unaffected. |
+
+`protect` is not accepted inside blocks — a gate always challenges. Unknown options, and any argument outside a block, fail adaptation.
+
+The legacy `anubisStatic` directive takes no arguments; it serves `/.within.website/` from the site server.
 
 ### Migrating from `init_anubis`
 
